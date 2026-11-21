@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+proto = { path = "proto" }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+# Debug builds of a video pipeline are too slow to judge latency; optimize deps even in dev.
+[profile.dev.package."*"]
+opt-level = 2
