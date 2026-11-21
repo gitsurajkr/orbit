@@ -1,5 +1,8 @@
 mod capture;
+mod input;
+mod net;
 mod nvenc;
+mod session;
 mod video;
 
 use anyhow::{Context, Result};
@@ -29,6 +32,9 @@ struct Args {
     /// Video bitrate in Mbit/s.
     #[arg(long, default_value_t = 20.0)]
     mbps: f64,
+    /// Address to listen on. Default: this PC's Tailscale IP, port 9000 (not exposed on the LAN).
+    #[arg(long)]
+    bind: Option<std::net::SocketAddr>,
 }
 
 fn main() -> Result<()> {
@@ -48,7 +54,23 @@ fn main() -> Result<()> {
     if args.bench {
         return bench(&args, mon);
     }
-    anyhow::bail!("network mode not built yet; use --list or --bench")
+    let bind = match args.bind {
+        Some(b) => b,
+        None => {
+            let ip = net::tailscale_ip().context("Tailscale address not found: is Tailscale running? Or pass --bind IP:PORT")?;
+            std::net::SocketAddr::new(ip.into(), proto::DEFAULT_PORT)
+        }
+    };
+    let settings = session::Settings { monitor: mon.clone(), fps: args.fps, bitrate_bps: (args.mbps * 1e6) as u32 };
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    rt.block_on(async {
+        let endpoint = net::endpoint(bind)?;
+        println!(
+            "rdesk-server listening on {bind} | {} {}x{} on '{}' | {} fps cap | {} Mbit/s",
+            mon.device_name, mon.width, mon.height, mon.adapter_name, args.fps, args.mbps
+        );
+        session::serve(endpoint, settings).await
+    })
 }
 
 fn bench(args: &Args, mon: capture::MonitorInfo) -> Result<()> {
