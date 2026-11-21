@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,13 +38,54 @@ pub fn endpoint(bind: SocketAddr) -> Result<quinn::Endpoint> {
     quinn::Endpoint::server(cfg, bind).with_context(|| format!("bind {bind}"))
 }
 
-/// This PC's Tailscale IPv4 address (100.64.0.0/10), found by asking the OS which local address
-/// routes to Tailscale's service IP. Nothing is sent.
+fn is_cgnat(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64
+}
+
+/// This PC's Tailscale IPv4 address: an address in 100.64.0.0/10 on a network adapter that is up
+/// and named "Tailscale". The adapter check matters: ISPs (carrier-grade NAT), hotspots and other
+/// VPNs hand out addresses in the same 100.64.0.0/10 range, and those must not be mistaken for
+/// Tailscale.
 pub fn tailscale_ip() -> Option<Ipv4Addr> {
-    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
-    s.connect("100.100.100.100:53").ok()?;
-    match s.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64 => Some(ip),
-        _ => None,
+    use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH};
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 32 * 1024u32;
+    let mut buf: Vec<u64> = Vec::new(); // u64 for alignment
+    for _ in 0..3 {
+        buf.resize((size as usize).div_ceil(8), 0);
+        let r = unsafe { GetAdaptersAddresses(AF_INET.0 as u32, flags, None, Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH), &mut size) };
+        if r == 0 {
+            break;
+        }
+        if r != 111 {
+            // anything but ERROR_BUFFER_OVERFLOW
+            return None;
+        }
     }
+    let mut a = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    unsafe {
+        while !a.is_null() {
+            let ad = &*a;
+            let name = ad.FriendlyName.to_string().unwrap_or_default().to_lowercase();
+            let desc = ad.Description.to_string().unwrap_or_default().to_lowercase();
+            if ad.OperStatus == IfOperStatusUp && (name.contains("tailscale") || desc.contains("tailscale")) {
+                let mut u = ad.FirstUnicastAddress;
+                while !u.is_null() {
+                    let sa = (*u).Address.lpSockaddr;
+                    if !sa.is_null() && (*sa).sa_family == AF_INET {
+                        let sin = &*(sa as *const SOCKADDR_IN);
+                        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.S_un.S_addr));
+                        if is_cgnat(ip) {
+                            return Some(ip);
+                        }
+                    }
+                    u = (*u).Next;
+                }
+            }
+            a = ad.Next;
+        }
+    }
+    None
 }

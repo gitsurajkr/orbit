@@ -377,7 +377,7 @@ fn footer(ui: &mut egui::Ui) {
     ui.painter().text(
         pos2(r.center().x, r.bottom() - 14.0),
         Align2::CENTER_CENTER,
-        "v0.1 · ENCRYPTED BY TAILSCALE · NVENC + QUIC",
+        "v0.1.1 · ENCRYPTED BY TAILSCALE · NVENC + QUIC",
         FontId::monospace(9.5),
         gray(80),
     );

@@ -2,7 +2,7 @@
 ;   ISCC installer\orbit.iss   ->  dist\ORBIT-Setup.exe
 
 #define AppName "ORBIT"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppExe "orbit.exe"
 
 [Setup]
