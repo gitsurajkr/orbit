@@ -15,8 +15,8 @@ pub mod video;
 
 /// Bumped whenever any byte layout in this crate changes.
 pub const VERSION: u16 = 1;
-/// QUIC ALPN, so an rdesk client can't talk to something else by accident.
-pub const ALPN: &[u8] = b"rdesk/1";
+/// QUIC ALPN, so an ORBIT client can't talk to something else by accident.
+pub const ALPN: &[u8] = b"orbit/1";
 /// Default UDP port.
 pub const DEFAULT_PORT: u16 = 9000;
 

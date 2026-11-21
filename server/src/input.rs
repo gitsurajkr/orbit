@@ -2,7 +2,7 @@
 //!
 //! Keys arrive as hardware scan codes, so the server's keyboard layout decides what character a
 //! key makes, just like a physical keyboard plugged into the server.
-//! Note: Windows blocks injected input into elevated (admin) windows unless rdesk-server itself
+//! Note: Windows blocks injected input into elevated (admin) windows unless ORBIT itself
 //! runs as administrator.
 
 use crate::capture::MonitorInfo;

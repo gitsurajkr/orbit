@@ -1,4 +1,4 @@
-# rdesk
+# ORBIT
 
 Low-latency remote desktop over Tailscale: Windows server with an NVIDIA GPU → Windows client.
 
@@ -8,40 +8,40 @@ client: QUIC datagrams ─► reassemble ─► GPU decode (Media Foundation/DXV
 input:  client window ─► mouse moves as datagrams, keys/buttons/wheel on a reliable stream ─► SendInput
 ```
 
-## Build (on each PC)
+## Use it: one exe on both PCs
+
+Copy **`orbit.exe`** to both PCs (nothing to install: no runtimes, works on any Windows 10/11 x64).
+Both PCs need Tailscale running and signed in to the same tailnet.
+
+1. On the PC you want to control (needs an NVIDIA GPU): open ORBIT → **SHARE** → hit the big
+   button. It shows this PC's Tailscale IP (click it to copy).
+2. On the other PC: open ORBIT → **CONNECT** → type that IP (or the Tailscale name) → hit the big
+   button or Enter. The remote screen opens in its own window; close it to come back.
+
+- Allow ORBIT through Windows Firewall when asked on the sharing PC. If Windows put the Tailscale
+  adapter under *Public*, allow public networks too (or set the adapter to Private).
+- Run ORBIT **as administrator** on the sharing PC if you need to control admin windows
+  (Windows blocks injected input into them otherwise).
+- In the viewer: `Ctrl+Alt+Enter` toggles fullscreen. The title bar shows fps and latency.
+- Settings and recent addresses live in `%APPDATA%\ORBIT\orbit.cfg`.
+
+## Build from source
 
 1. Install Rust: https://rustup.rs (MSVC toolchain), plus **Visual Studio Build Tools** with the
    "Desktop development with C++" workload (Rust needs its linker).
-2. `cargo build --release`
+2. `cargo build --release` → `targetelease\orbit.exe` (also `orbit-server.exe` /
+   `orbit-client.exe`, command-line versions that print stats every second).
 
-Binaries: `target\release\rdesk-server.exe`, `target\release\rdesk-client.exe`.
-(LLVM is only needed to regenerate `server/src/nvenc/sys.rs`; it's committed.)
+LLVM is only needed to regenerate `server/src/nvenc/sys.rs`; it's committed.
 
-## Run
-
-On the **server** (the PC with the RTX GPU), with Tailscale running:
+Command-line use:
 
 ```
-rdesk-server --list                 # monitors and which GPU drives each
-rdesk-server                        # listens on this PC's Tailscale IP, port 9000
-rdesk-server --fps 120 --mbps 30    # higher frame rate / bitrate
+orbit-server --list                 # monitors and which GPU drives each
+orbit-server --fps 120 --mbps 30    # share (listens on this PC's Tailscale IP, port 9000)
+orbit-server --bench                # capture + encode only, no network
+orbit-client 100.x.y.z [--view-only]
 ```
-
-Allow it through Windows Firewall when asked. If Windows put the Tailscale adapter under the
-*Public* profile, allow public networks too (or set the adapter to Private).
-Run it **as administrator** if you need to control elevated (admin) windows: Windows blocks
-injected input into them otherwise.
-
-On the **client** (laptop):
-
-```
-rdesk-client 100.x.y.z              # the server's Tailscale IP or MagicDNS name
-rdesk-client my-pc --view-only      # watch without sending input
-```
-
-`Ctrl+Alt+Enter` toggles fullscreen. Close the window to disconnect.
-
-Benchmark capture + encode alone on the server: `rdesk-server --bench`.
 
 ## Reading the stats
 
@@ -67,5 +67,7 @@ Client, once a second:
 - One monitor (`--monitor N`); no clipboard; remote cursor shape isn't shown (the client's own
   arrow cursor is used, which is what makes the pointer feel instant).
 - Win key, Alt+Tab, Ctrl+Esc are taken by the client's Windows, not forwarded.
+- The sharing PC must stay **unlocked**: Windows doesn't let normal apps capture the lock screen
+  or UAC prompts (that needs a SYSTEM service; planned). ORBIT waits and resumes on unlock.
 - Hybrid laptops as *server*: if the screen is on the integrated GPU, frames are copied to the
   NVIDIA GPU through system memory (a few ms extra).

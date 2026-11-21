@@ -215,8 +215,11 @@ impl Duplicator {
                     self.dup = Some(d);
                     return Ok(());
                 }
-                Err(e) if attempt < 100 && (e.code() == windows::Win32::Foundation::E_ACCESSDENIED || e.code() == DXGI_ERROR_UNSUPPORTED || e.code() == DXGI_ERROR_SESSION_DISCONNECTED) => {
+                Err(e) if attempt < 30 && (e.code() == windows::Win32::Foundation::E_ACCESSDENIED || e.code() == DXGI_ERROR_UNSUPPORTED || e.code() == DXGI_ERROR_SESSION_DISCONNECTED) => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) if e.code() == windows::Win32::Foundation::E_ACCESSDENIED => {
+                    bail!("this PC's screen is locked (or a UAC prompt is open): Windows doesn't allow capturing it. Unlock it and the picture comes back on its own")
                 }
                 Err(e) => return Err(e).context("DuplicateOutput"),
             }

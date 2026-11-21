@@ -1,9 +1,4 @@
-mod capture;
-mod input;
-mod net;
-mod nvenc;
-mod session;
-mod video;
+use server::{capture, net, session, video};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -12,7 +7,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "rdesk-server", about = "rdesk server: streams this PC's screen")]
+#[command(name = "orbit-server", about = "ORBIT server: streams this PC's screen")]
 struct Args {
     /// List monitors and which GPU drives each, then exit.
     #[arg(long)]
@@ -39,9 +34,7 @@ struct Args {
 
 fn main() -> Result<()> {
     // Without per-monitor DPI awareness, Desktop Duplication refuses to start on scaled displays.
-    unsafe {
-        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    server::dpi_aware();
     let args = Args::parse();
     let monitors = capture::list_monitors()?;
     if args.list {
@@ -66,10 +59,10 @@ fn main() -> Result<()> {
     rt.block_on(async {
         let endpoint = net::endpoint(bind)?;
         println!(
-            "rdesk-server listening on {bind} | {} {}x{} on '{}' | {} fps cap | {} Mbit/s",
+            "orbit-server listening on {bind} | {} {}x{} on '{}' | {} fps cap | {} Mbit/s",
             mon.device_name, mon.width, mon.height, mon.adapter_name, args.fps, args.mbps
         );
-        session::serve(endpoint, settings).await
+        session::serve(endpoint, settings, Default::default()).await
     })
 }
 

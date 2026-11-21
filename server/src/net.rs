@@ -2,7 +2,7 @@
 //!
 //! TLS: a fresh self-signed certificate each run, and the client doesn't verify it yet.
 //! Tailscale (WireGuard) already encrypts and authenticates which devices can reach this port;
-//! rdesk's own pairing comes in the auth milestone.
+//! ORBIT's own pairing comes in the auth milestone.
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -25,7 +25,7 @@ pub fn transport() -> quinn::TransportConfig {
 }
 
 pub fn endpoint(bind: SocketAddr) -> Result<quinn::Endpoint> {
-    let cert = rcgen::generate_simple_self_signed(vec!["rdesk".to_string()])?;
+    let cert = rcgen::generate_simple_self_signed(vec!["orbit".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))

@@ -19,7 +19,7 @@ use proto::stats::{mbit_per_s, Dist, Ticker};
 use proto::video::{fragment, fragment_count};
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// quinn's datagram queue. Large on purpose so quinn never silently drops from the middle of a
@@ -36,9 +36,35 @@ pub struct Settings {
 struct Shared {
     force_idr: AtomicBool,
     stop: Arc<AtomicBool>,
+    status: Arc<Status>,
 }
 
-pub async fn serve(endpoint: quinn::Endpoint, settings: Settings) -> Result<()> {
+/// What the server is doing, for a UI to show. Updated by the session and video thread.
+#[derive(Default)]
+pub struct Status {
+    inner: Mutex<StatusInfo>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct StatusInfo {
+    /// Address of the connected client, if any.
+    pub client: Option<String>,
+    /// Latest once-a-second stats line.
+    pub stats: Option<String>,
+    /// Latest problem (cleared when things work again).
+    pub error: Option<String>,
+}
+
+impl Status {
+    pub fn get(&self) -> StatusInfo {
+        self.inner.lock().unwrap().clone()
+    }
+    fn update(&self, f: impl FnOnce(&mut StatusInfo)) {
+        f(&mut self.inner.lock().unwrap());
+    }
+}
+
+pub async fn serve(endpoint: quinn::Endpoint, settings: Settings, status: Arc<Status>) -> Result<()> {
     let mut current: Option<(Connection, Arc<AtomicBool>, tokio::task::JoinHandle<()>)> = None;
     while let Some(incoming) = endpoint.accept().await {
         let conn = match incoming.await {
@@ -58,16 +84,71 @@ pub async fn serve(endpoint: quinn::Endpoint, settings: Settings) -> Result<()> 
         }
         let stop = Arc::new(AtomicBool::new(false));
         let s = settings.clone();
-        let (c, st) = (conn.clone(), stop.clone());
+        let (c, st, status) = (conn.clone(), stop.clone(), status.clone());
         let task = tokio::spawn(async move {
-            match session(c.clone(), s, st).await {
-                Ok(()) => println!("session ended: {}", c.remote_address()),
-                Err(e) => println!("session ended: {}: {e:#}", c.remote_address()),
+            let addr = c.remote_address().to_string();
+            status.update(|i| {
+                i.client = Some(addr.clone());
+                i.stats = None;
+                i.error = None;
+            });
+            let r = session(c.clone(), s, st, status.clone()).await;
+            match &r {
+                Ok(()) => println!("session ended: {addr}"),
+                Err(e) => println!("session ended: {addr}: {e:#}"),
             }
+            status.update(|i| {
+                if i.client.as_deref() == Some(addr.as_str()) {
+                    i.client = None;
+                    i.stats = None;
+                }
+                if let Err(e) = r {
+                    i.error = Some(format!("{e:#}"));
+                }
+            });
         });
         current = Some((conn, stop, task));
     }
+    // Endpoint closed (sharing stopped): end the running session too.
+    if let Some((old, stop, task)) = current.take() {
+        stop.store(true, Ordering::Release);
+        old.close(0u32.into(), b"server stopped");
+        let _ = task.await;
+    }
     Ok(())
+}
+
+/// A server running on its own threads, for the UI.
+pub struct ServerHandle {
+    endpoint: quinn::Endpoint,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pub status: Arc<Status>,
+    pub bind: std::net::SocketAddr,
+}
+
+impl ServerHandle {
+    pub fn start(settings: Settings, bind: std::net::SocketAddr) -> Result<ServerHandle> {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+        let endpoint = {
+            let _guard = rt.enter();
+            crate::net::endpoint(bind)?
+        };
+        let status = Arc::new(Status::default());
+        let (ep, st) = (endpoint.clone(), status.clone());
+        let thread = std::thread::Builder::new().name("orbit-server".into()).spawn(move || {
+            if let Err(e) = rt.block_on(serve(ep, settings, st.clone())) {
+                st.update(|i| i.error = Some(format!("{e:#}")));
+            }
+        })?;
+        Ok(ServerHandle { endpoint, thread: Some(thread), status, bind })
+    }
+
+    pub fn stop(mut self) {
+        self.endpoint.close(0u32.into(), b"server stopped");
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 async fn read_ctrl(r: &mut RecvStream) -> Result<Ctrl> {
@@ -86,7 +167,7 @@ async fn write_ctrl(w: &mut SendStream, c: Ctrl) -> Result<()> {
     Ok(())
 }
 
-async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>) -> Result<()> {
+async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: Arc<Status>) -> Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await.context("no control stream")??;
     match read_ctrl(&mut recv).await? {
         Ctrl::ClientHello { version } => ensure!(version == proto::VERSION, "client protocol {version}, server {}", proto::VERSION),
@@ -94,7 +175,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>) -> Result
     }
     write_ctrl(&mut send, Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
-    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), stop: stop.clone() });
+    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), stop: stop.clone(), status });
     let video = {
         let (conn, s, shared) = (conn.clone(), s.clone(), shared.clone());
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
@@ -151,9 +232,13 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
         let mut p = match Pipeline::new(s.monitor.clone(), s.fps, s.bitrate_bps) {
-            Ok(p) => p,
+            Ok(p) => {
+                shared.status.update(|i| i.error = None);
+                p
+            }
             Err(e) => {
                 eprintln!("video pipeline failed to start: {e:#}; retrying");
+                shared.status.update(|i| i.error = Some(format!("{e:#}")));
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
@@ -161,6 +246,22 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         let mut need_idr = true;
         while !shared.stop.load(Ordering::Acquire) {
             let started = Instant::now();
+            // Stats first, so a still screen (no frames to send) still reports 0 fps.
+            if let Some(secs) = ticker.tick(started) {
+                let st = conn.stats();
+                let (fps, mbit, enc, rtt) = (frames as f64 / secs, mbit_per_s(bytes, secs), enc_ms.take(), conn.rtt().as_secs_f64() * 1e3);
+                println!(
+                    "send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | rtt {rtt:.1} ms | lost pkts {}",
+                    if p.bridged() { format!("bridge ms {} | ", bridge_ms.take()) } else { String::new() },
+                    st.path.lost_packets - lost_prev,
+                );
+                let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
+                shared.status.update(|i| {
+                    i.stats = Some(format!("{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · DROPPED {dropped}"))
+                });
+                lost_prev = st.path.lost_packets;
+                (frames, bytes, keys, dropped) = (0, 0, 0, 0);
+            }
             let force = shared.force_idr.swap(false, Ordering::AcqRel) | need_idr;
             buf.clear();
             let e = match p.next(50, force, &mut buf) {
@@ -221,22 +322,6 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             enc_ms.add(e.encode_ms);
             bridge_ms.add(e.bridge_ms);
 
-            if let Some(secs) = ticker.tick(Instant::now()) {
-                let st = conn.stats();
-                println!(
-                    "send fps {:5.1} | {:6.2} Mbit/s | encode ms {} | {}key {} | dropped {} | rtt {:.1} ms | lost pkts {}",
-                    frames as f64 / secs,
-                    mbit_per_s(bytes, secs),
-                    enc_ms.take(),
-                    if p.bridged() { format!("bridge ms {} | ", bridge_ms.take()) } else { String::new() },
-                    keys,
-                    dropped,
-                    conn.rtt().as_secs_f64() * 1e3,
-                    st.path.lost_packets - lost_prev,
-                );
-                lost_prev = st.path.lost_packets;
-                (frames, bytes, keys, dropped) = (0, 0, 0, 0);
-            }
             if let Some(rest) = interval.checked_sub(started.elapsed()) {
                 std::thread::sleep(rest);
             }

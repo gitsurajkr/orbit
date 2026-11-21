@@ -71,7 +71,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
         _: &[u8],
         _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // v1: Tailscale authenticates the peer device; rdesk pairing comes later.
+        // v1: Tailscale authenticates the peer device; ORBIT pairing comes later.
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -135,9 +135,9 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
     let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse()? } else { "[::]:0".parse()? };
     let mut endpoint = quinn::Endpoint::client(bind)?;
     endpoint.set_default_client_config(client_config()?);
-    let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(server, "rdesk")?)
+    let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(server, "orbit")?)
         .await
-        .with_context(|| format!("no answer from {server} (is rdesk-server running and reachable over Tailscale?)"))??;
+        .with_context(|| format!("no answer from {server} (is ORBIT sharing on that PC and reachable over Tailscale?)"))??;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_ctrl(&mut send, Ctrl::ClientHello { version: proto::VERSION }).await?;
     let (width, height, fps) = match tokio::time::timeout(Duration::from_secs(5), read_ctrl(&mut recv)).await.context("no hello from server")?? {
