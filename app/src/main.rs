@@ -10,6 +10,7 @@
 mod autostart;
 mod config;
 mod icon;
+mod tray;
 mod ui;
 mod update;
 mod widgets;

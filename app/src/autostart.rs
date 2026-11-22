@@ -12,7 +12,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE};
 use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const VALUE: PCWSTR = w!("ORBIT");
@@ -51,8 +51,7 @@ pub fn single_instance() -> Option<SingleInstance> {
         let h = CreateMutexW(None, true, w!("Local\\ORBIT-launcher")).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(hwnd) = FindWindowW(None, w!("ORBIT")) {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-                let _ = SetForegroundWindow(hwnd);
+                crate::tray::show_window(hwnd); // also brings it out of the tray
             }
             return None;
         }

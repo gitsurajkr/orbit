@@ -57,6 +57,11 @@ struct App {
     auto_share_at: Option<Instant>,
     /// The user pressed STOP: don't auto-share again until ORBIT restarts.
     user_stopped: bool,
+    /// Notification-area icon; None if Windows refused (then ORBIT minimizes to the taskbar).
+    tray: Option<crate::tray::Tray>,
+    /// Started at login: go to the tray at this time (eframe shows the window after its first
+    /// frame, which resets the style that keeps it off the taskbar, so not on the first frame).
+    tray_at: Option<Instant>,
 }
 
 impl App {
@@ -95,6 +100,8 @@ impl App {
             first_frame: true,
             auto_share_at: if auto_share { Some(Instant::now()) } else { None },
             user_stopped: false,
+            tray: crate::tray::Tray::start(),
+            tray_at: None,
         }
     }
 
@@ -141,7 +148,7 @@ impl App {
             ctx2.request_repaint();
         });
         self.viewer = Some(result);
-        ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+        self.to_tray(ctx);
     }
 
     fn poll_viewer(&mut self, ctx: &egui::Context) {
@@ -156,8 +163,40 @@ impl App {
                     self.connect_error = Some(e); // a disconnect the user asked for isn't an error
                 }
             }
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
+            self.from_tray(ctx);
+        }
+    }
+
+    /// Sends the window to the tray (no taskbar button), or minimizes it without a tray.
+    fn to_tray(&self, ctx: &egui::Context) {
+        match &self.tray {
+            Some(t) => t.hide_main(),
+            None => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
+        }
+    }
+
+    /// Brings the window back up in front.
+    fn from_tray(&self, ctx: &egui::Context) {
+        match &self.tray {
+            Some(t) => t.show_main(),
+            None => {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+        }
+    }
+
+    /// Tray tooltip: what ORBIT is doing right now.
+    fn tray_tip(&self) -> String {
+        if self.viewer.is_some() {
+            format!("ORBIT · CONNECTED TO {}", self.viewer_addr)
+        } else if let Some(s) = &self.server {
+            match s.status.get().client {
+                Some(c) => format!("ORBIT · SHARING · {} CONNECTED", c.split(':').next().unwrap_or(&c)),
+                None => "ORBIT · SHARING · WAITING".into(),
+            }
+        } else {
+            "ORBIT".into()
         }
     }
 
@@ -246,8 +285,14 @@ impl eframe::App for App {
         if self.first_frame {
             self.first_frame = false;
             if self.launched_at_login {
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+                self.tray_at = Some(Instant::now() + Duration::from_millis(500));
             }
+        }
+        if self.tray_at.is_some_and(|t| Instant::now() >= t) {
+            self.tray_at = None;
+            self.to_tray(ctx);
+        } else if self.tray_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
         // Auto-share: keep trying (Tailscale and the network can take a while after boot).
         if self.cfg.autostart && self.server.is_none() && !self.user_stopped && self.auto_share_at.is_some_and(|t| Instant::now() >= t) {
@@ -259,6 +304,9 @@ impl eframe::App for App {
         }
         self.poll_viewer(ctx);
         self.finish_disconnect(ctx);
+        if let Some(t) = &self.tray {
+            t.set_tip(&self.tray_tip());
+        }
         self.updater.tick(ctx);
         match self.updater.launch_if_ready() {
             Ok(true) => {
@@ -277,7 +325,14 @@ impl eframe::App for App {
         }
         widgets::background(ctx);
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-            title_bar(ui, ctx, &mut self.updater);
+            match title_bar(ui, ctx, &mut self.updater) {
+                // With a tray icon both buttons send ORBIT to the tray (sharing keeps running);
+                // quit from the tray menu. Without one: close and minimize as usual.
+                Some(_) if self.tray.is_some() => self.to_tray(ctx),
+                Some(WindowButton::Close) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Some(WindowButton::Minimize) => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
+                None => {}
+            }
             update_banner(ui, ctx, &mut self.updater);
             ui.add_space(8.0);
             header(ui);
@@ -303,6 +358,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(t) = &self.tray {
+            t.remove();
+        }
         if let Some(s) = self.server.take() {
             s.stop();
         }
@@ -464,7 +522,7 @@ fn label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).font(FontId::monospace(10.5)).color(gray(140)));
 }
 
-fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Updater) {
+fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Updater) -> Option<WindowButton> {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), TITLE_H), Sense::click_and_drag());
     if resp.drag_started() {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
@@ -503,6 +561,7 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Upd
         b.on_hover_text(format!("ORBIT v{} · check GitHub for a new version", crate::update::CURRENT));
     }
     // window buttons
+    let mut clicked = None;
     for i in 0..2 {
         let r = egui::Rect::from_min_size(pos2(rect.right() - 46.0 * (i as f32 + 1.0), rect.top()), vec2(46.0, TITLE_H - 1.0));
         let b = ui.interact(r, ui.id().with(("winbtn", i)), Sense::click());
@@ -518,9 +577,15 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Upd
             ui.painter().line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], ink);
         }
         if b.clicked() {
-            ctx.send_viewport_cmd(if i == 0 { ViewportCommand::Close } else { ViewportCommand::Minimized(true) });
+            clicked = Some(if i == 0 { WindowButton::Close } else { WindowButton::Minimize });
         }
     }
+    clicked
+}
+
+enum WindowButton {
+    Close,
+    Minimize,
 }
 
 /// White strip under the title bar when a new version is out.
