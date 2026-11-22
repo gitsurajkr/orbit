@@ -258,6 +258,22 @@ pub fn chip(ui: &mut Ui, label: &str) -> Response {
     resp
 }
 
+/// Bordered text button; `primary` is filled white (inverts on hover either way).
+pub fn button(ui: &mut Ui, label: &str, primary: bool) -> Response {
+    let font = FontId::monospace(13.0);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), W);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(28.0, 16.0), Sense::click());
+    let hov = resp.hovered();
+    if hov {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let filled = primary != hov;
+    ui.painter().rect_filled(rect, 0.0, if filled { W } else { B });
+    ui.painter().rect_stroke(rect, 0.0, stk(1.0, W));
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, if filled { B } else { W });
+    resp
+}
+
 /// Inverted message box (white background) for errors and notices.
 pub fn notice(ui: &mut Ui, text: &str) {
     egui::Frame::none().fill(W).inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {

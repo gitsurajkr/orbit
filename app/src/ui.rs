@@ -34,6 +34,13 @@ struct App {
     cfg: Config,
     addr: String,
     viewer: Option<ViewerResult>,
+    /// Process id and address of the running viewer.
+    viewer_pid: Option<u32>,
+    viewer_addr: String,
+    /// The disconnect confirmation box is open.
+    confirm_disconnect: bool,
+    /// When the user confirmed a disconnect (force-close the viewer if it hangs).
+    disconnect_at: Option<Instant>,
     connect_error: Option<String>,
     server: Option<server::ServerHandle>,
     share_error: Option<String>,
@@ -71,6 +78,10 @@ impl App {
             addr: cfg.recent.first().cloned().unwrap_or_default(),
             cfg,
             viewer: None,
+            viewer_pid: None,
+            viewer_addr: String::new(),
+            confirm_disconnect: false,
+            disconnect_at: None,
             connect_error: None,
             server: None,
             share_error: None,
@@ -115,6 +126,8 @@ impl App {
                 return;
             }
         };
+        self.viewer_pid = Some(child.id());
+        self.viewer_addr = addr.clone();
         let result: ViewerResult = Arc::new(Mutex::new(None));
         let (r, ctx2) = (result.clone(), ctx.clone());
         std::thread::spawn(move || {
@@ -135,11 +148,72 @@ impl App {
         let done = self.viewer.as_ref().and_then(|v| v.lock().unwrap().take());
         if let Some(r) = done {
             self.viewer = None;
+            self.viewer_pid = None;
+            self.confirm_disconnect = false;
+            let asked = self.disconnect_at.take().is_some();
             if let Err(e) = r {
-                self.connect_error = Some(e);
+                if !asked {
+                    self.connect_error = Some(e); // a disconnect the user asked for isn't an error
+                }
             }
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+    }
+
+    /// Closes the viewer the way its own close button does, so it says goodbye to the sharing PC
+    /// (which then frees its screen at once instead of after its 5 s timeout).
+    fn disconnect(&mut self) {
+        self.confirm_disconnect = false;
+        if let Some(pid) = self.viewer_pid {
+            close_viewer(pid);
+            self.disconnect_at = Some(Instant::now());
+        }
+    }
+
+    /// Force-closes a viewer that didn't close within 3 s of a disconnect.
+    fn finish_disconnect(&mut self, ctx: &egui::Context) {
+        if let (Some(t), Some(pid)) = (self.disconnect_at, self.viewer_pid) {
+            let waited = Instant::now().saturating_duration_since(t);
+            if waited > Duration::from_secs(3) {
+                kill_viewer(pid);
+                self.disconnect_at = Some(Instant::now() + Duration::from_secs(3600)); // only once
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+    }
+
+    /// The "disconnect?" box, over a dimmed window.
+    fn disconnect_dialog(&mut self, ctx: &egui::Context) {
+        let (mut cancel, mut confirm) = (false, false);
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("dim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter().rect_filled(r, 0.0, egui::Color32::from_black_alpha(215));
+            cancel |= resp.clicked(); // click outside the box
+        });
+        egui::Area::new(egui::Id::new("confirm_disconnect")).order(egui::Order::Tooltip).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            egui::Frame::none().fill(B).stroke(stk(1.0, W)).inner_margin(egui::Margin::same(22.0)).show(ui, |ui| {
+                ui.set_width(320.0);
+                ui.label(RichText::new("DISCONNECT?").font(FontId::monospace(20.0)).color(W));
+                ui.add_space(10.0);
+                ui.label(RichText::new(format!("END THE SESSION WITH {}.\nTHE VIEWER WINDOW WILL CLOSE.", self.viewer_addr)).font(FontId::monospace(11.5)).color(gray(170)));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                    cancel |= widgets::button(ui, "CANCEL", false).clicked();
+                    confirm |= widgets::button(ui, "DISCONNECT", true).clicked();
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("ESC CANCEL · ENTER DISCONNECT").font(FontId::monospace(10.0)).color(gray(100)));
+            });
+        });
+        let (esc, enter) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::Enter)));
+        if confirm || enter {
+            self.disconnect();
+        } else if cancel || esc {
+            self.confirm_disconnect = false;
         }
     }
 
@@ -184,6 +258,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.poll_viewer(ctx);
+        self.finish_disconnect(ctx);
         self.updater.tick(ctx);
         match self.updater.launch_if_ready() {
             Ok(true) => {
@@ -222,6 +297,9 @@ impl eframe::App for App {
             });
             footer(ui);
         });
+        if self.confirm_disconnect && self.viewer.is_some() {
+            self.disconnect_dialog(ctx);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -273,12 +351,23 @@ impl App {
         }
         ui.add_space(4.0);
 
-        let clicked = widgets::orbit_button(ui, "connect", if busy { "LIVE" } else { "CONNECT" }, if busy { "VIEWER OPEN" } else { "↵ ENTER" }, busy, !busy).clicked();
+        let leaving = self.disconnect_at.is_some();
+        let sub = if leaving { "DISCONNECTING..." } else if busy { "CLICK TO DISCONNECT" } else { "↵ ENTER" };
+        let clicked = widgets::orbit_button(ui, "connect", if busy { "LIVE" } else { "CONNECT" }, sub, busy, !leaving).clicked();
         if (clicked || enter) && !busy {
             self.connect(ctx);
+        } else if clicked && busy {
+            self.confirm_disconnect = true;
         }
         if busy {
-            widgets::status_line(ui, "CONNECTED IN ANOTHER WINDOW · CLOSE IT TO COME BACK", true);
+            ui.horizontal(|ui| {
+                widgets::status_line(ui, &format!("CONNECTED TO {}", self.viewer_addr), true);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !leaving && widgets::button(ui, "DISCONNECT", false).clicked() {
+                        self.confirm_disconnect = true;
+                    }
+                });
+            });
         } else if let Some(e) = &self.connect_error {
             widgets::notice(ui, &e.to_uppercase());
         } else {
@@ -577,4 +666,33 @@ fn theme(ctx: &egui::Context) {
         font.family = egui::FontFamily::Monospace;
     }
     ctx.set_style(style);
+}
+
+/// Sends WM_CLOSE to the viewer process's visible windows, like clicking its close button.
+fn close_viewer(pid: u32) {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut owner));
+        if owner == lp.0 as u32 && IsWindowVisible(hwnd).as_bool() {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(pid as isize));
+    }
+}
+
+/// Last resort for a viewer that ignored WM_CLOSE.
+fn kill_viewer(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(h, 1);
+            let _ = CloseHandle(h);
+        }
+    }
 }
