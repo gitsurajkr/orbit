@@ -231,6 +231,8 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let mut buf = Vec::with_capacity(1 << 20);
     let mut ticker = Ticker::new(Duration::from_secs(1));
     let (mut frames, mut bytes, mut keys, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    // Time spent waiting for the network to drain the send queue (per stats second).
+    let mut net_wait = Duration::ZERO;
     let (mut enc_ms, mut bridge_ms) = (Dist::default(), Dist::default());
     let mut lost_prev = conn.stats().path.lost_packets;
 
@@ -256,8 +258,9 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             if let Some(secs) = ticker.tick(started) {
                 let st = conn.stats();
                 let (fps, mbit, enc, rtt) = (frames as f64 / secs, mbit_per_s(bytes, secs), enc_ms.take(), conn.rtt().as_secs_f64() * 1e3);
+                let wait_ms = net_wait.as_secs_f64() * 1e3;
                 println!(
-                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | rtt {rtt:.1} ms | lost pkts {}",
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {}",
                     p.capture_mode(),
                     if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
                     st.path.lost_packets - lost_prev,
@@ -268,10 +271,20 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     _ => "",
                 };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · DROPPED {dropped}"))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}"))
                 });
                 lost_prev = st.path.lost_packets;
-                (frames, bytes, keys, dropped) = (0, 0, 0, 0);
+                (frames, bytes, keys, dropped, net_wait) = (0, 0, 0, 0, Duration::ZERO);
+            }
+            // Backpressure: while quinn still holds more than ~2 frames of unsent data, don't
+            // capture or encode at all. Skipping *before* the encoder keeps its reference chain
+            // intact (no keyframe needed), and Desktop Duplication merges the changes made
+            // meanwhile, so the next capture is still the newest screen.
+            let backlog = DATAGRAM_SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space());
+            if backlog > backlog_limit {
+                std::thread::sleep(Duration::from_millis(2));
+                net_wait += started.elapsed();
+                continue;
             }
             let force = shared.force_idr.swap(false, Ordering::AcqRel) | need_idr;
             buf.clear();
@@ -298,8 +311,9 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             let backlog = DATAGRAM_SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space());
             let wire = fragment_count(buf.len(), max) * max;
             if backlog > backlog_limit || wire > conn.datagram_send_buffer_space() {
-                // The network isn't keeping up. Sending this frame would only queue it behind
-                // older data; drop it and send a fresh keyframe once the queue drains.
+                // Fallback for one frame too big for the queue's free space (the check above
+                // normally waits before encoding). Dropping an encoded frame breaks the
+                // reference chain, so the next frame must be a keyframe.
                 dropped += 1;
                 need_idr = true;
                 continue;
