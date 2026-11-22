@@ -109,6 +109,8 @@ fn client_config() -> Result<quinn::ClientConfig> {
     t.mtu_discovery_config(None);
     t.datagram_receive_buffer_size(Some(4 << 20));
     t.datagram_send_buffer_size(64 * 1024);
+    // Same congestion control as the server (see server/src/net.rs); here it only paces input.
+    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }

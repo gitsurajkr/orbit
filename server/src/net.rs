@@ -21,6 +21,15 @@ pub fn transport() -> quinn::TransportConfig {
     t.mtu_discovery_config(None);
     t.datagram_send_buffer_size(crate::session::DATAGRAM_SEND_BUFFER);
     t.datagram_receive_buffer_size(Some(4 << 20));
+    // Congestion control for the video we send. BBR measures the path's bandwidth and minimum
+    // RTT and paces to them, instead of filling buffers until packets drop (Cubic, quinn's
+    // default) - which on a Tailscale relay means queueing delay and bursts of loss.
+    // quinn calls its BBR experimental: `ORBIT_CC=cubic` switches back, to compare or fall back.
+    if std::env::var("ORBIT_CC").is_ok_and(|v| v.eq_ignore_ascii_case("cubic")) {
+        println!("congestion control: cubic (ORBIT_CC)");
+    } else {
+        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     t
 }
 
