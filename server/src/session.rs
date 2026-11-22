@@ -285,7 +285,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     _ => "",
                 };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}"))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} ({}) · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}", rate.reason().to_uppercase()))
                 });
                 lost_prev = st.path.lost_packets;
                 sent_prev = st.path.sent_packets;
