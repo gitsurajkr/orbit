@@ -202,18 +202,31 @@ impl Reassembler {
 /// Decides which frames may go to the decoder and when to ask for a keyframe.
 ///
 /// After any loss, H.264 deltas reference a picture the decoder never got, so they'd decode as
-/// garbage: skip them until a keyframe arrives. Keep asking (every `interval`) until one does,
-/// so a lost request or lost keyframe can't freeze the picture forever.
+/// garbage: skip them until a keyframe arrives. Keep asking (every `retry`, see
+/// [`keyframe_retry`]) until one does, so a lost request or lost keyframe can't freeze the
+/// picture forever.
 pub struct KeyframeGate {
     waiting: bool,
     last_request: Option<Instant>,
-    interval: Duration,
+}
+
+/// How long to wait for a requested keyframe before asking again: the request and the keyframe
+/// each take about half a round trip, plus the keyframe's own time on the wire and jitter.
+/// Asking sooner only makes the server send extra keyframes for the same loss.
+pub fn keyframe_retry(rtt: Duration) -> Duration {
+    (rtt * 2 + Duration::from_millis(50)).clamp(Duration::from_millis(150), Duration::from_secs(1))
+}
+
+impl Default for KeyframeGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyframeGate {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new() -> Self {
         // Waiting from the start: nothing decodes before the first keyframe.
-        KeyframeGate { waiting: true, last_request: None, interval }
+        KeyframeGate { waiting: true, last_request: None }
     }
 
     pub fn on_lost(&mut self) {
@@ -230,8 +243,8 @@ impl KeyframeGate {
     }
 
     /// True if a keyframe request should be sent now.
-    pub fn should_request(&mut self, now: Instant) -> bool {
-        if self.waiting && self.last_request.is_none_or(|t| now.duration_since(t) >= self.interval) {
+    pub fn should_request(&mut self, now: Instant, retry: Duration) -> bool {
+        if self.waiting && self.last_request.is_none_or(|t| now.duration_since(t) >= retry) {
             self.last_request = Some(now);
             return true;
         }
@@ -358,17 +371,26 @@ mod tests {
 
     #[test]
     fn gate_skips_deltas_and_repeats_requests_until_keyframe() {
-        let mut g = KeyframeGate::new(Duration::from_millis(100));
+        let mut g = KeyframeGate::new();
+        let r = Duration::from_millis(100);
         let t = Instant::now();
         assert!(!g.admit(false));
-        assert!(g.should_request(t));
-        assert!(!g.should_request(t + Duration::from_millis(50)));
-        assert!(g.should_request(t + Duration::from_millis(100))); // lost request is retried
+        assert!(g.should_request(t, r));
+        assert!(!g.should_request(t + Duration::from_millis(50), r));
+        assert!(g.should_request(t + Duration::from_millis(100), r)); // lost request is retried
         assert!(g.admit(true));
         assert!(g.admit(false));
-        assert!(!g.should_request(t + Duration::from_secs(1)));
+        assert!(!g.should_request(t + Duration::from_secs(1), r));
         g.on_lost();
         assert!(!g.admit(false));
-        assert!(g.should_request(t + Duration::from_secs(1)));
+        assert!(g.should_request(t + Duration::from_secs(1), r));
+    }
+
+    #[test]
+    fn keyframe_retry_follows_rtt() {
+        let ms = Duration::from_millis;
+        assert_eq!(keyframe_retry(ms(2)), ms(150)); // LAN: floor
+        assert_eq!(keyframe_retry(ms(90)), ms(230)); // relayed Tailscale
+        assert_eq!(keyframe_retry(ms(800)), ms(1000)); // cap
     }
 }

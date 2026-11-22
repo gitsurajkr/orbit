@@ -9,7 +9,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use proto::clock::{now_us, ClockSync};
 use proto::ctrl::{Ctrl, HEADER_LEN};
-use proto::video::{Event, Frame, KeyframeGate, Reassembler};
+use proto::video::{keyframe_retry, Event, Frame, KeyframeGate, Reassembler};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{Connection, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -56,8 +56,6 @@ pub struct Session {
 
 /// How long a partly received frame may wait for its missing fragments.
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(80);
-/// Keyframe request repeat interval while waiting for one.
-const KEYFRAME_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct SkipVerify(Arc<rustls::crypto::CryptoProvider>);
@@ -184,7 +182,7 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
         let (conn, stats, failed, ctrl) = (conn.clone(), stats.clone(), decoder_failed.clone(), ctrl_tx.clone());
         tokio::spawn(async move {
             let mut reasm = Reassembler::new(REASSEMBLY_TIMEOUT);
-            let mut gate = KeyframeGate::new(KEYFRAME_RETRY);
+            let mut gate = KeyframeGate::new();
             let mut tick = tokio::time::interval(Duration::from_millis(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut events = Vec::new();
@@ -221,7 +219,7 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
                         }
                     }
                 }
-                if gate.should_request(Instant::now()) {
+                if gate.should_request(Instant::now(), keyframe_retry(conn.rtt())) {
                     stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
                     let _ = ctrl.send(Ctrl::KeyframeRequest);
                 }
