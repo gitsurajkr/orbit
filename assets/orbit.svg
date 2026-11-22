@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="ORBIT">
+  <defs>
+    <mask id="gap">
+      <rect width="128" height="128" fill="#fff"/>
+      <circle cx="96.58" cy="31.42" r="20.67" fill="#000"/>
+    </mask>
+  </defs>
+  <circle cx="64" cy="64" r="62.72" fill="#000"/>
+  <circle cx="64" cy="64" r="46.08" fill="none" stroke="#fff" stroke-width="7.04" mask="url(#gap)"/>
+  <circle cx="64" cy="64" r="16.64" fill="#fff"/>
+  <circle cx="96.58" cy="31.42" r="10.88" fill="#fff"/>
+</svg>

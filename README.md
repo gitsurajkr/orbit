@@ -1,112 +1,185 @@
+<div align="center">
+
+<img src="assets/orbit.svg" width="112" alt="ORBIT logo">
+
 # ORBIT
 
-Low-latency remote desktop over Tailscale: Windows server with an NVIDIA GPU → Windows client.
+**Low-latency remote desktop for Windows, built on the GPU from capture to screen.**
 
-```
-server: DXGI capture ─► NVENC H.264 (sync, P1 ultra-low-latency, CBR, 1-frame VBV) ─► QUIC datagrams
-client: QUIC datagrams ─► reassemble ─► GPU decode (Media Foundation/DXVA) ─► tearing flip-model present
-input:  client window ─► mouse moves as datagrams, keys/buttons/wheel on a reliable stream ─► SendInput
-```
+Control your NVIDIA-powered PC from anywhere over Tailscale: smooth 60 fps, adaptive quality and
+packet-loss recovery, in a single portable `.exe`.
 
-## Use it: one exe on both PCs
+[![Latest release](https://img.shields.io/github/v/release/gitsurajkr/orvia-desk?label=release&color=black)](https://github.com/gitsurajkr/orvia-desk/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-black)](LICENSE)
+![Windows 10/11](https://img.shields.io/badge/Windows-10%20%7C%2011-black?logo=windows)
+![Rust](https://img.shields.io/badge/Rust-black?logo=rust)
 
-Copy **`orbit.exe`** to both PCs (nothing to install: no runtimes, works on any Windows 10/11 x64).
-Both PCs need Tailscale running and signed in to the same tailnet.
+[**Download installer**](https://github.com/gitsurajkr/orvia-desk/releases/latest/download/ORBIT-Setup.exe) ·
+[**Portable orbit.exe**](https://github.com/gitsurajkr/orvia-desk/releases/latest/download/orbit.exe) ·
+[All releases](https://github.com/gitsurajkr/orvia-desk/releases)
 
-1. On the PC you want to control (needs an NVIDIA GPU): open ORBIT → **SHARE** → hit the big
-   button. It shows this PC's Tailscale IP (click it to copy).
-2. On the other PC: open ORBIT → **CONNECT** → type that IP (or the Tailscale name) → hit the big
-   button or Enter. The remote screen opens in its own window; close it to come back.
+</div>
 
-- Allow ORBIT through Windows Firewall when asked on the sharing PC. If Windows put the Tailscale
-  adapter under *Public*, allow public networks too (or set the adapter to Private).
-- Run ORBIT **as administrator** on the sharing PC if you need to control admin windows
-  (Windows blocks injected input into them otherwise).
-- In the viewer: `Ctrl+Alt+Enter` toggles fullscreen. The title bar shows fps and latency.
-- Settings and recent addresses live in `%APPDATA%\ORBIT\orbit.cfg`.
+---
 
-## Unattended: share automatically after every restart
+## Highlights
 
-On the sharing PC, in ORBIT's SHARE tab, tick **START SHARING WHEN WINDOWS STARTS**. From then on
-ORBIT opens minimized at every Windows sign-in and starts sharing by itself (retrying every 5 s
-until Tailscale and the network are up). It also resumes sharing after an update.
+|   |   |
+|---|---|
+| **GPU end to end** | Desktop Duplication capture → NVENC H.264 → hardware decode → tearing flip-model present. On a PC whose screen runs on the NVIDIA GPU, frames never leave video memory before encoding. |
+| **Always the newest frame** | No frame queues anywhere. If the network falls behind, ORBIT waits before encoding instead of sending stale frames, so latency stays flat. |
+| **Adapts to the link** | Bitrate follows round-trip time, packet loss and send-queue pressure every second. The encoder is retuned live, without a keyframe. |
+| **Survives packet loss** | Every frame carries Reed-Solomon parity (10–40 %, following measured loss). Lost packets are rebuilt on arrival: no freeze, no resend. |
+| **QUIC + BBR transport** | Video travels as unreliable QUIC datagrams, paced by BBR congestion control, over Tailscale's encrypted WireGuard tunnel. |
+| **Runs quietly** | Lives in the notification area, can start sharing when Windows starts, and updates itself from GitHub Releases. |
 
-ORBIT needs a signed-in, unlocked desktop (Windows doesn't let normal apps capture the sign-in
-screen). For restarts with nobody at the PC, also set up:
+## How it works
 
-1. **Windows signs in automatically.** Easiest and safest: Microsoft's free
-   [Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon) tool (stores the
-   password encrypted). Run it, enter the account and password, click Enable.
-   (Only do this on a PC in a place you trust: anyone at the keyboard gets in.)
-2. **Tailscale connects before sign-in:** Tailscale tray icon → Preferences → **Run unattended**.
-3. **Don't let it lock or sleep:** Settings → Accounts → Sign-in options → "If you've been away,
-   when should Windows require you to sign in again?" → **Never**; Settings → System → Power →
-   Screen and sleep → sleep **Never** (turning the screen off is fine).
-
-## Updates
-
-Every ORBIT checks GitHub Releases at startup and every 30 minutes. When a newer version is out,
-a white banner appears: **UPDATE** downloads the installer, verifies its SHA-256, installs it
-silently (one admin prompt) and reopens ORBIT. Nothing installs without that click.
-
-To publish a new version (from a clean, committed tree):
-
-```
-.\release.ps1 0.1.2
+```mermaid
+flowchart LR
+    subgraph S["Sharing PC · NVIDIA GPU"]
+        direction TB
+        CAP["DXGI Desktop Duplication"] --> ENC["NVENC H.264<br/>ultra-low-latency · CBR"]
+        ENC --> FEC["Reed-Solomon FEC<br/>+ packetizer"]
+        CTL(["Rate controller<br/>RTT · loss · queue"]) -. bitrate · FEC % .-> ENC
+        INP["SendInput"]
+    end
+    subgraph V["Viewing PC"]
+        direction TB
+        REA["Reassembly<br/>+ FEC recovery"] --> DEC["Media Foundation<br/>GPU decode"]
+        DEC --> PRE["D3D11 flip-model<br/>tearing present"]
+        WIN["Viewer window"]
+    end
+    FEC == "QUIC datagrams over Tailscale" ==> REA
+    WIN -. "mouse · keyboard" .-> INP
 ```
 
-It bumps the version, tags `v0.1.2` and pushes; the GitHub workflow builds `ORBIT-Setup.exe` and
-publishes the release. Plain pushes to `main` don't trigger updates, only version tags do.
+1. **Capture.** Desktop Duplication delivers a frame only when the screen changes, as a GPU texture.
+2. **Encode.** NVENC (P1 preset, ultra-low-latency tuning, no B-frames, one-frame VBV) turns it into H.264 on the same GPU.
+3. **Protect.** The frame is split into equal-size shards plus parity shards. The viewer can rebuild it from *any* sufficient subset, so a few lost packets cost nothing.
+4. **Send.** Shards go out as QUIC datagrams, never retransmitted, so nothing old can block something new.
+5. **Decode and present.** The viewer reassembles the frame, decodes it on its GPU and presents it immediately with tearing enabled (no wait for vsync).
+6. **Control.** Mouse moves travel as datagrams; keys, buttons and wheel go on a reliable stream; the sharing PC injects them with `SendInput`.
 
-## Build from source
+## Quick start
 
-1. Install Rust: https://rustup.rs (MSVC toolchain), plus **Visual Studio Build Tools** with the
-   "Desktop development with C++" workload (Rust needs its linker).
-2. `cargo build --release` → `target
-elease\orbit.exe` (also `orbit-server.exe` /
-   `orbit-client.exe`, command-line versions that print stats every second).
+> **You need:** two Windows 10/11 PCs signed in to the same [Tailscale](https://tailscale.com) network.
+> The PC being controlled needs an **NVIDIA GPU** (for NVENC).
 
-LLVM is only needed to regenerate `server/src/nvenc/sys.rs`; it's committed.
+1. **Install** ORBIT on both PCs with the [installer](https://github.com/gitsurajkr/orvia-desk/releases/latest/download/ORBIT-Setup.exe), or just run the portable `orbit.exe`.
+2. **On the PC you want to control:** open ORBIT → **SHARE** → press the big button. It shows this PC's Tailscale IP (click to copy).
+3. **On the other PC:** open ORBIT → **CONNECT** → type that IP or Tailscale name → press the big button or <kbd>Enter</kbd>.
 
-Command-line use:
+The remote screen opens in its own window. To end the session, close that window, or press **DISCONNECT** in ORBIT.
 
-```
-orbit-server --list                 # monitors and which GPU drives each
-orbit-server --fps 120 --mbps 30    # share (UDP 9000; only Tailscale peers are accepted)
-orbit-server --bench                # capture + encode only, no network
-orbit-client 100.x.y.z [--view-only]
-```
+| In the viewer | |
+|---|---|
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Enter</kbd> | Toggle fullscreen |
+| Title bar | Live fps, bitrate and latency |
+| **VIEW ONLY** (CONNECT tab) | Watch without controlling |
+
+> [!TIP]
+> Run `tailscale status` and look at the other PC's line. `direct` means the best latency. `relay "bom"` (or another city) means traffic goes through a Tailscale relay, which adds tens of milliseconds. Being on the same Wi-Fi or having IPv6 on both networks usually gives a direct path.
+
+## In the background
+
+ORBIT sits in the **notification area** next to the clock:
+
+- **Left-click** the icon to open ORBIT. **Right-click** for *Open ORBIT* / *Quit ORBIT*.
+- **Hover** to see what it's doing, e.g. `ORBIT · SHARING · 100.x.y.z CONNECTED`.
+- The window's **─** and **✕** buttons send ORBIT to the tray, so sharing keeps running. Quit from the tray menu.
+
+### Share automatically after every restart
+
+On the sharing PC, tick **START SHARING WHEN WINDOWS STARTS** in the SHARE tab. ORBIT then starts in the tray at every sign-in and begins sharing once Tailscale and the network are up. If the network drops the listener, ORBIT restarts it by itself.
+
+Windows only lets apps capture a signed-in, unlocked desktop. For restarts with nobody at the PC, also set up:
+
+1. **Automatic sign-in:** Microsoft's free [Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon) tool (stores the password encrypted). Only do this on a PC in a place you trust.
+2. **Tailscale before sign-in:** Tailscale tray icon → Preferences → **Run unattended**.
+3. **No lock, no sleep:** Settings → Accounts → Sign-in options → require sign-in again → **Never**. Settings → System → Power → sleep → **Never** (turning the screen off is fine).
+
+### Updates
+
+ORBIT checks GitHub Releases at startup and every 30 minutes. When a new version is out, an **UPDATE** banner appears. One click downloads the installer, verifies its SHA-256, installs it and reopens ORBIT. Nothing installs without that click.
+
+## Performance
+
+Measured, not estimated:
+
+| Setup | Result |
+|---|---|
+| Loopback, laptop with a hybrid GPU (screen on iGPU, NVENC on GTX 1650 Ti) | **12–20 ms** capture → present, including the cross-GPU copy · ~58 fps at 1080p |
+| Internet, RTX 4070 Super desktop → laptop over a direct Tailscale path (~50 ms ping) | Video playback with **0 dropped frames**, adaptive bitrate settling around 11 Mbit/s |
+| Loopback with one packet dropped in every 3rd frame | **0 frames lost**, **0 keyframe requests**: all losses rebuilt by FEC |
+
+Latency is measured from capture on the sharing PC to present on the viewer, on synchronized clocks. It doesn't include the monitor's own scan-out delay.
 
 ## Reading the stats
 
-Server, once a second:
-`send fps | Mbit/s | encode ms avg/p95/max | key (keyframes sent) | dropped | rtt | lost pkts`
-- **dropped**: frames skipped because the network was behind by more than ~2 frames (they would
-  only have added delay). Steady drops mean `--mbps` is above what the link carries.
+**SHARE tab** (sharing PC), every second:
 
-Client, once a second:
-`fps (recv) | Mbit/s | latency ms | decode ms | frame spread ms | rtt | lost skip keyreq`
-- **latency**: server capture → client present, on synchronized clocks. Doesn't include the
-  monitor's own scan-out delay.
-- **frame spread**: first to last datagram of a frame. Big values mean frames are too large
-  for the link.
-- **lost / skip / keyreq**: frames lost in transit, deltas skipped while waiting for a keyframe,
-  keyframe requests sent.
+| Field | Meaning |
+|---|---|
+| `FPS` · `MBIT/S` | Frames and bitrate actually sent |
+| `RATE x (REASON)` | Bitrate the controller allows right now, and why: `MAX`, `CLIMB`, `PROBE`, `HOLD`, `BURST`, `RTT`, `LOSS`, `QUEUE`, `NET WAIT` |
+| `FEC n%` | Parity added per frame (rises with packet loss) |
+| `ENCODE` | NVENC time per frame |
+| `RTT` | Round-trip time to the viewer |
+| `NET WAIT` | Time spent waiting for the network to drain. High values mean the link is the limit |
+| `DROPPED` | Encoded frames thrown away (should stay at 0) |
 
-## Known limits (v1)
+**Viewer title bar:** `fps (recv) | Mbit/s | latency ms avg/p95/max`. The full line, printed when the viewer runs from a terminal, adds `decode ms`, `frame spread ms`, `rtt` and `lost · skip · keyreq · fec-fixed`. `fec-fixed` counts frames that FEC saved from being lost.
 
-- No pairing or auth yet: ORBIT accepts connections only from Tailscale addresses, so anyone on
-  your tailnet can connect. Tailscale ACLs are the access control for now. The certificate isn't
-  verified.
-- Latency depends on Tailscale finding a **direct** path. If `tailscale status` shows the other PC
-  with `relay "bom"` (or another city) instead of an address, every packet goes through
-  Tailscale's relay server and adds tens of ms. Carrier-grade NAT (an ISP address starting with
-  100.64-100.127) is the usual cause; IPv6 on both networks or the same Wi-Fi usually fixes it.
-- Adaptive bitrate from RTT, loss and send-queue waits (the BITRATE setting is the ceiling) and Reed-Solomon FEC (10–40 %, follows loss); a frame losing more packets than its parity covers still costs one keyframe.
-- One monitor (`--monitor N`); no clipboard; remote cursor shape isn't shown (the client's own
-  arrow cursor is used, which is what makes the pointer feel instant).
-- Win key, Alt+Tab, Ctrl+Esc are taken by the client's Windows, not forwarded.
-- The sharing PC must stay **unlocked**: Windows doesn't let normal apps capture the lock screen
-  or UAC prompts (that needs a SYSTEM service; planned). ORBIT waits and resumes on unlock.
-- Hybrid laptops as *server*: if the screen is on the integrated GPU, frames are copied to the
-  NVIDIA GPU through system memory (a few ms extra).
+## Security
+
+> [!IMPORTANT]
+> ORBIT relies on **Tailscale** for security today.
+
+- Traffic is encrypted end to end by Tailscale's WireGuard tunnel (and by QUIC's TLS 1.3 on top).
+- ORBIT accepts connections **only from Tailscale addresses** (100.64.0.0/10, fd7a:115c:a1e0::/48). Anything from your LAN or the internet is refused.
+- There is **no pairing or password yet**, and the viewer doesn't verify the server's certificate. Anyone on your tailnet can connect, so use [Tailscale ACLs](https://tailscale.com/kb/1018/acls) to choose who can reach port 9000.
+- Never forward UDP port 9000 on your router.
+
+## Known limits
+
+- One monitor at a time. No clipboard sync yet.
+- The remote cursor shape isn't shown; your own pointer is used (which is also why it feels instant).
+- <kbd>Win</kbd>, <kbd>Alt</kbd>+<kbd>Tab</kbd> and <kbd>Ctrl</kbd>+<kbd>Esc</kbd> are handled by the viewing PC, not forwarded.
+- The sharing PC must stay **unlocked**: the lock screen and UAC prompts can't be captured by a normal app. ORBIT waits and resumes on unlock.
+- To control apps running as administrator, run ORBIT as administrator on the sharing PC.
+- On hybrid laptops used for sharing, frames are copied from the integrated GPU to the NVIDIA GPU (a few ms extra).
+
+## Roadmap
+
+- [ ] NVENC reference-frame invalidation: recover from heavy loss without a keyframe
+- [ ] Lower resolution automatically on very slow links
+- [ ] "Relayed via Tailscale" indicator with the extra latency
+- [ ] Pairing with a PIN and certificate pinning
+- [ ] Clipboard sync and multi-monitor switching
+- [ ] Remote cursor shape, and forwarding <kbd>Win</kbd> / <kbd>Alt</kbd>+<kbd>Tab</kbd>
+- [ ] Lock screen and UAC capture (Windows service)
+
+## Build from source
+
+Requires [Rust](https://rustup.rs) (MSVC toolchain) and Visual Studio Build Tools with the *Desktop development with C++* workload.
+
+```powershell
+cargo build --release
+# target\release\orbit.exe          the app (CONNECT / SHARE)
+# target\release\orbit-server.exe   command-line sharing, prints stats every second
+# target\release\orbit-client.exe   command-line viewer
+```
+
+```powershell
+orbit-server --list                   # monitors and which GPU drives each
+orbit-server --fps 120 --mbps 30      # share on UDP 9000 (Tailscale peers only)
+orbit-server --bench --dump out.h264  # capture + encode only, no network
+orbit-client 100.x.y.z --view-only
+```
+
+Settings and recent addresses are stored in `%APPDATA%\ORBIT\orbit.cfg`.
+
+## License
+
+[MIT](LICENSE) © 2026 Suraj Kumar
