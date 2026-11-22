@@ -42,6 +42,26 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64
 }
 
+/// Where ORBIT listens: every local address, port 9000. Binding to the Tailscale IP itself broke
+/// after reboots (Tailscale's adapter comes and goes while it starts, leaving a dead socket);
+/// instead, connections from anything but a Tailscale address are refused (see [`is_tailnet`]).
+pub fn default_bind() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], proto::DEFAULT_PORT))
+}
+
+/// True for Tailscale addresses (100.64.0.0/10, fd7a:115c:a1e0::/48) and loopback (for testing).
+/// Everything else (LAN, internet) is refused: until ORBIT has its own pairing, Tailscale is the
+/// lock on the door.
+pub fn is_tailnet(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_cgnat(v4) || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_cgnat(v4) || v4.is_loopback(),
+            None => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+        },
+    }
+}
+
 /// This PC's Tailscale IPv4 address: an address in 100.64.0.0/10 on a network adapter that is up
 /// and named "Tailscale". The adapter check matters: ISPs (carrier-grade NAT), hotspots and other
 /// VPNs hand out addresses in the same 100.64.0.0/10 range, and those must not be mistaken for

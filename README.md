@@ -72,7 +72,7 @@ Command-line use:
 
 ```
 orbit-server --list                 # monitors and which GPU drives each
-orbit-server --fps 120 --mbps 30    # share (listens on this PC's Tailscale IP, port 9000)
+orbit-server --fps 120 --mbps 30    # share (UDP 9000; only Tailscale peers are accepted)
 orbit-server --bench                # capture + encode only, no network
 orbit-client 100.x.y.z [--view-only]
 ```
@@ -95,8 +95,13 @@ Client, once a second:
 
 ## Known limits (v1)
 
-- No pairing or auth yet: anyone who can reach the port on your tailnet can connect. Tailscale
-  ACLs are the access control for now. The certificate isn't verified.
+- No pairing or auth yet: ORBIT accepts connections only from Tailscale addresses, so anyone on
+  your tailnet can connect. Tailscale ACLs are the access control for now. The certificate isn't
+  verified.
+- Latency depends on Tailscale finding a **direct** path. If `tailscale status` shows the other PC
+  with `relay "bom"` (or another city) instead of an address, every packet goes through
+  Tailscale's relay server and adds tens of ms. Carrier-grade NAT (an ISP address starting with
+  100.64-100.127) is the usual cause; IPv6 on both networks or the same Wi-Fi usually fixes it.
 - Fixed bitrate (no adaptive bitrate yet), no FEC: a lost packet costs one keyframe.
 - One monitor (`--monitor N`); no clipboard; remote cursor shape isn't shown (the client's own
   arrow cursor is used, which is what makes the pointer feel instant).

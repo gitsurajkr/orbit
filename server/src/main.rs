@@ -27,7 +27,7 @@ struct Args {
     /// Video bitrate in Mbit/s.
     #[arg(long, default_value_t = 20.0)]
     mbps: f64,
-    /// Address to listen on. Default: this PC's Tailscale IP, port 9000 (not exposed on the LAN).
+    /// Address to listen on. Default 0.0.0.0:9000; only Tailscale (and loopback) peers are accepted.
     #[arg(long)]
     bind: Option<std::net::SocketAddr>,
 }
@@ -47,13 +47,11 @@ fn main() -> Result<()> {
     if args.bench {
         return bench(&args, mon);
     }
-    let bind = match args.bind {
-        Some(b) => b,
-        None => {
-            let ip = net::tailscale_ip().context("Tailscale address not found: is Tailscale running? Or pass --bind IP:PORT")?;
-            std::net::SocketAddr::new(ip.into(), proto::DEFAULT_PORT)
-        }
-    };
+    let bind = args.bind.unwrap_or_else(net::default_bind);
+    match net::tailscale_ip() {
+        Some(ip) => println!("this PC's Tailscale IP: {ip} (type it on the other PC)"),
+        None => println!("Tailscale isn't connected yet; ORBIT accepts connections as soon as it is"),
+    }
     let settings = session::Settings { monitor: mon.clone(), fps: args.fps, bitrate_bps: (args.mbps * 1e6) as u32 };
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     rt.block_on(async {

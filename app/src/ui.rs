@@ -154,9 +154,10 @@ impl App {
         self.share_error = None;
         let start = || -> anyhow::Result<server::ServerHandle> {
             let mon = server::preflight(self.monitor)?;
-            let ip = server::net::tailscale_ip().ok_or_else(|| anyhow::anyhow!("TAILSCALE ISN'T RUNNING ON THIS PC: start it, then try again"))?;
             let settings = server::Settings { monitor: mon, fps: FPS_OPTIONS[self.cfg.fps_index], bitrate_bps: (self.cfg.mbps * 1e6) as u32 };
-            server::ServerHandle::start(settings, std::net::SocketAddr::new(ip.into(), proto::DEFAULT_PORT))
+            // Listens on all addresses but only accepts Tailscale peers, so sharing can start
+            // before Tailscale is up (e.g. right after boot) and survives Tailscale restarts.
+            server::ServerHandle::start(settings, server::net::default_bind())
         };
         match start() {
             Ok(s) => self.server = Some(s),

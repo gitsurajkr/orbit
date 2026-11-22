@@ -19,6 +19,8 @@
 - [ ] First real in-app update: on a PC with v0.1.3, click UPDATE → installs v0.1.4 and reopens.
 
 ## Later
+- [ ] Show "TAILSCALE RELAY (city) · +xx ms" in ORBIT when the link to the other PC isn't
+      direct (from `tailscale status --json`), so high latency explains itself.
 - [ ] Adaptive bitrate (milestone 4): lower/raise bitrate from drops, loss and RTT
       (`Encoder::set_bitrate` already exists).
 - [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).

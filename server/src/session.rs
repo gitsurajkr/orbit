@@ -67,6 +67,12 @@ impl Status {
 pub async fn serve(endpoint: quinn::Endpoint, settings: Settings, status: Arc<Status>) -> Result<()> {
     let mut current: Option<(Connection, Arc<AtomicBool>, tokio::task::JoinHandle<()>)> = None;
     while let Some(incoming) = endpoint.accept().await {
+        let remote = incoming.remote_address();
+        if !crate::net::is_tailnet(remote.ip()) {
+            eprintln!("refused {remote}: not a Tailscale address");
+            incoming.refuse();
+            continue;
+        }
         let conn = match incoming.await {
             Ok(c) => c,
             Err(e) => {
