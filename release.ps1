@@ -5,7 +5,10 @@
 # shows an update banner within 30 minutes (or at its next start).
 
 param([Parameter(Mandatory = $true)][string]$Version)
-$ErrorActionPreference = 'Stop'
+# Not 'Stop': cargo and git print normal progress on stderr, which Windows PowerShell would treat
+# as an error. Each native step is checked by its exit code instead.
+$ErrorActionPreference = 'Continue'
+function Assert-Ok($what) { if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" } }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Use a version like 0.1.2" }
 Set-Location $PSScriptRoot
@@ -22,10 +25,10 @@ Write-Host "Version: $current -> version = `"$Version`""
 cargo build --release -p app
 if ($LASTEXITCODE -ne 0) { git checkout -- Cargo.toml; throw "Build failed; version change undone." }
 
-git add Cargo.toml Cargo.lock
-git commit -m "release v$Version"
-git tag "v$Version"
-git push origin HEAD "v$Version"
+git add Cargo.toml Cargo.lock; Assert-Ok "git add"
+git commit -q -m "release v$Version"; Assert-Ok "git commit"
+git tag "v$Version"; Assert-Ok "git tag"
+git push origin HEAD "v$Version"; Assert-Ok "git push"
 Write-Host ""
 Write-Host "Pushed v$Version. GitHub is building the release:"
 Write-Host "  https://github.com/gitsurajkr/orvia-desk/actions"
