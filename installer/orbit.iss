@@ -1,8 +1,11 @@
 ; ORBIT installer (Inno Setup 6). Build: cargo build --release, then
-;   ISCC installer\orbit.iss   ->  dist\ORBIT-Setup.exe
+;   ISCC /DAppVersion=0.1.2 installer\orbit.iss   ->  dist\ORBIT-Setup.exe
+; (release.ps1 and the GitHub release workflow pass the version for you.)
 
 #define AppName "ORBIT"
-#define AppVersion "0.1.1"
+#ifndef AppVersion
+  #define AppVersion "0.0.0-dev"
+#endif
 #define AppExe "orbit.exe"
 
 [Setup]
@@ -47,6 +50,8 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; StatusMsg: "Configuring Windows Firewall..."
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#AppName}"" dir=in action=allow program=""{app}\{#AppExe}"" protocol=UDP profile=any enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall..."
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; In-app updates run the installer silently: start the new version afterwards, as the normal user.
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"

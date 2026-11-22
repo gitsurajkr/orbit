@@ -10,10 +10,19 @@
 mod config;
 mod icon;
 mod ui;
+mod update;
 mod widgets;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--check-update") {
+        match update::check() {
+            Ok(Some(r)) => println!("update available: v{} (this is v{})", r.version, update::CURRENT),
+            Ok(None) => println!("up to date (v{})", update::CURRENT),
+            Err(e) => println!("check failed: {e:#}"),
+        }
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--connect") {
         let Some(addr) = args.get(i + 1) else {
             eprintln!("--connect needs an address");

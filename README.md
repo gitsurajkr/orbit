@@ -25,6 +25,21 @@ Both PCs need Tailscale running and signed in to the same tailnet.
 - In the viewer: `Ctrl+Alt+Enter` toggles fullscreen. The title bar shows fps and latency.
 - Settings and recent addresses live in `%APPDATA%\ORBIT\orbit.cfg`.
 
+## Updates
+
+Every ORBIT checks GitHub Releases at startup and every 30 minutes. When a newer version is out,
+a white banner appears: **UPDATE** downloads the installer, verifies its SHA-256, installs it
+silently (one admin prompt) and reopens ORBIT. Nothing installs without that click.
+
+To publish a new version (from a clean, committed tree):
+
+```
+.\release.ps1 0.1.2
+```
+
+It bumps the version, tags `v0.1.2` and pushes; the GitHub workflow builds `ORBIT-Setup.exe` and
+publishes the release. Plain pushes to `main` don't trigger updates, only version tags do.
+
 ## Build from source
 
 1. Install Rust: https://rustup.rs (MSVC toolchain), plus **Visual Studio Build Tools** with the

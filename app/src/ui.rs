@@ -42,6 +42,7 @@ struct App {
     tailscale_ip: Option<String>,
     ip_checked: Instant,
     copied_at: Option<Instant>,
+    updater: crate::update::Updater,
 }
 
 impl App {
@@ -60,6 +61,7 @@ impl App {
             tailscale_ip: server::net::tailscale_ip().map(|ip| ip.to_string()),
             ip_checked: Instant::now(),
             copied_at: None,
+            updater: crate::update::Updater::new(),
         }
     }
 
@@ -142,6 +144,18 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_viewer(ctx);
+        self.updater.tick(ctx);
+        match self.updater.launch_if_ready() {
+            Ok(true) => {
+                // The installer takes over from here and starts the new version when done.
+                if let Some(s) = self.server.take() {
+                    s.stop();
+                }
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            Ok(false) => {}
+            Err(e) => self.connect_error = Some(format!("{e:#}")),
+        }
         if self.ip_checked.elapsed() > Duration::from_secs(3) {
             self.tailscale_ip = server::net::tailscale_ip().map(|ip| ip.to_string());
             self.ip_checked = Instant::now();
@@ -149,6 +163,7 @@ impl eframe::App for App {
         widgets::background(ctx);
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
             title_bar(ui, ctx);
+            update_banner(ui, ctx, &mut self.updater);
             ui.add_space(8.0);
             header(ui);
             ui.add_space(8.0);
@@ -337,6 +352,64 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context) {
     }
 }
 
+/// White strip under the title bar when a new version is out.
+fn update_banner(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Updater) {
+    use crate::update::State;
+    let state = up.state();
+    if matches!(state, State::Idle) {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+    let p = ui.painter().clone();
+    p.rect_filled(rect, 0.0, W);
+    let left = pos2(rect.left() + 16.0, rect.center().y);
+    let font = FontId::monospace(11.5);
+    match state {
+        State::Idle => {}
+        State::Available(rel) => {
+            let t = ctx.input(|i| i.time) as f32;
+            p.circle_filled(pos2(left.x + 4.0, left.y), 3.5, egui::Color32::from_gray((60.0 + 60.0 * (t * 4.0).sin()) as u8));
+            p.text(pos2(left.x + 16.0, left.y), Align2::LEFT_CENTER, format!("NEW VERSION v{} IS OUT", rel.version), font.clone(), B);
+            let mut x = rect.right() - 8.0;
+            for (i, label) in ["LATER", "UPDATE"].iter().enumerate() {
+                let w = if i == 0 { 62.0 } else { 78.0 };
+                let r = egui::Rect::from_min_max(pos2(x - w, rect.top() + 5.0), pos2(x, rect.bottom() - 5.0));
+                x -= w + 6.0;
+                let b = ui.interact(r, ui.id().with(("upd", i)), Sense::click());
+                let solid = i == 1;
+                let hov = b.hovered();
+                if hov {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let (bg, fg) = if solid != hov { (B, W) } else { (W, B) };
+                p.rect_filled(r, 0.0, bg);
+                p.rect_stroke(r, 0.0, stk(1.0, B));
+                p.text(r.center(), Align2::CENTER_CENTER, *label, FontId::monospace(11.0), fg);
+                if b.clicked() {
+                    if solid {
+                        up.start_download(ctx);
+                    } else {
+                        up.dismiss();
+                    }
+                }
+            }
+        }
+        State::Downloading { version } => {
+            let (done, total) = up.progress();
+            let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+            p.text(left, Align2::LEFT_CENTER, format!("DOWNLOADING v{version} · {:.0}%", frac * 100.0), font.clone(), B);
+            let bar = egui::Rect::from_min_max(pos2(rect.right() - 170.0, rect.center().y - 4.0), pos2(rect.right() - 16.0, rect.center().y + 4.0));
+            p.rect_stroke(bar, 0.0, stk(1.0, B));
+            p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(bar.width() * frac, bar.height())), 0.0, B);
+            ctx.request_repaint();
+        }
+        State::Failed(e) => {
+            let msg: String = format!("UPDATE FAILED: {}", e.to_uppercase()).chars().take(60).collect();
+            p.text(left, Align2::LEFT_CENTER, msg, font, B);
+        }
+    }
+}
+
 fn header(ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.label(RichText::new(spaced("ORBIT")).font(FontId::monospace(46.0)).color(W));
@@ -377,7 +450,7 @@ fn footer(ui: &mut egui::Ui) {
     ui.painter().text(
         pos2(r.center().x, r.bottom() - 14.0),
         Align2::CENTER_CENTER,
-        "v0.1.1 · ENCRYPTED BY TAILSCALE · NVENC + QUIC",
+        format!("v{} · ENCRYPTED BY TAILSCALE · NVENC + QUIC", crate::update::CURRENT),
         FontId::monospace(9.5),
         gray(80),
     );
