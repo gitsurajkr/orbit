@@ -7,6 +7,8 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual re-run from the Actions tab (pick the tag in "Use workflow from").
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,6 +23,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}".TrimStart('v')
+          if ("${{ github.ref_type }}" -ne "tag") { throw "Run this from a version tag (v1.2.3), not a branch" }
           $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           if ($tag -ne $ver) { throw "tag v$tag doesn't match Cargo.toml version $ver" }
           "VERSION=$ver" >> $env:GITHUB_ENV
