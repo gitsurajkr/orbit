@@ -29,6 +29,7 @@
 - [ ] Multi-monitor switching from the viewer.
 - [ ] Forward Win key / Alt+Tab (low-level keyboard hook in the viewer).
 - [ ] Show the remote cursor shape (I-beam, resize arrows).
-- [ ] FEC or intra-refresh so a lost packet doesn't cost a whole keyframe.
+- [x] FEC: Reed-Solomon parity per frame, 10–40 % following loss (protocol v2).
+- [ ] NVENC reference-frame invalidation, so a frame FEC can't save costs no keyframe either.
 - [ ] Tray icon while sharing.
 - [ ] Code-sign the exe/installer (removes the SmartScreen "unknown publisher" warning).

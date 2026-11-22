@@ -17,7 +17,7 @@ use anyhow::{bail, ensure, Context, Result};
 use proto::clock::now_us;
 use proto::ctrl::{Ctrl, MouseMove, HEADER_LEN};
 use proto::stats::{mbit_per_s, Dist, Ticker};
-use proto::video::{fragment, fragment_count};
+use proto::video::{datagram_count, fragment};
 use quinn::{Connection, RecvStream, SendDatagramError, SendStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -243,7 +243,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     'pipeline: while !shared.stop.load(Ordering::Acquire) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
-        let mut p = match Pipeline::new(s.monitor.clone(), s.fps, rate.bps()) {
+        let mut p = match Pipeline::new(s.monitor.clone(), s.fps, rate.video_bps()) {
             Ok(p) => {
                 shared.status.update(|i| i.error = None);
                 p
@@ -265,16 +265,18 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 let wait_ms = net_wait.as_secs_f64() * 1e3;
                 let lost = st.path.lost_packets - lost_prev;
                 let report = Report { rtt: conn.rtt(), sent_packets: st.path.sent_packets - sent_prev, lost_packets: lost, net_wait: net_wait.as_secs_f64() / secs };
-                let (old_bps, new_bps) = (rate.bps(), rate.update(&report));
-                if new_bps != old_bps {
-                    match p.encoder().set_bitrate(new_bps) {
-                        Ok(()) => backlog_limit = backlog_limit_for(new_bps),
-                        Err(e) => eprintln!("set bitrate {new_bps}: {e:#}"),
+                let old_video = rate.video_bps();
+                let new_bps = rate.update(&report);
+                backlog_limit = backlog_limit_for(new_bps);
+                let new_video = rate.video_bps();
+                if new_video != old_video {
+                    if let Err(e) = p.encoder().set_bitrate(new_video) {
+                        eprintln!("set bitrate {new_video}: {e:#}");
                     }
                 }
-                let target = new_bps as f64 / 1e6;
+                let (target, fec) = (new_bps as f64 / 1e6, rate.fec_percent());
                 println!(
-                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {lost}",
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | fec {fec}% | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {lost}",
                     p.capture_mode(),
                     rate.reason(),
                     if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
@@ -285,7 +287,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     _ => "",
                 };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} ({}) · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}", rate.reason().to_uppercase()))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} ({}) · FEC {fec}% · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}", rate.reason().to_uppercase()))
                 });
                 lost_prev = st.path.lost_packets;
                 sent_prev = st.path.sent_packets;
@@ -324,7 +326,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 return;
             };
             let backlog = DATAGRAM_SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space());
-            let wire = fragment_count(buf.len(), max) * max;
+            let wire = datagram_count(buf.len(), max, rate.fec_percent()) * max;
             if backlog > backlog_limit || wire > conn.datagram_send_buffer_space() {
                 // Fallback for one frame too big for the queue's free space (the check above
                 // normally waits before encoding). Dropping an encoded frame breaks the
@@ -333,7 +335,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 need_idr = true;
                 continue;
             }
-            let grams = match fragment(frame_id, e.capture_us, e.keyframe, &buf, max) {
+            let grams = match fragment(frame_id, e.capture_us, e.keyframe, &buf, max, rate.fec_percent()) {
                 Ok(g) => g,
                 Err(err) => {
                     eprintln!("fragment: {err:#}");

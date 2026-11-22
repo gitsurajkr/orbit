@@ -21,6 +21,10 @@
 //! After a cut: wait [`HOLD`] clean seconds, then climb +10 % per second, but only up to 90 %
 //! of the rate where trouble happened; above that, probe slowly (+1 % of max per second). The
 //! trouble rate is forgotten after [`FORGET`] clean seconds, in case the path got better.
+//!
+//! FEC (Reed-Solomon parity, see proto/video.rs) follows loss: +5 points for each second with
+//! any lost packet, -1 per clean second, between 10 and 40 %. The rate above is the total on
+//! the wire; the encoder gets [`RateControl::video_bps`] = rate x 100 / (100 + FEC %).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -33,6 +37,12 @@ const RTT_WINDOW: usize = 10;
 const HOLD: u32 = 3;
 /// Clean seconds after which the rate where trouble happened stops capping the climb.
 const FORGET: u32 = 30;
+/// FEC parity as a percent of data shards: start, floor, ceiling, steps.
+const FEC_START: u32 = 15;
+const FEC_MIN: u32 = 10;
+const FEC_MAX: u32 = 40;
+const FEC_UP: u32 = 5;
+const FEC_DOWN: u32 = 1;
 
 /// One second of measurements.
 #[derive(Clone, Copy, Debug)]
@@ -53,17 +63,29 @@ pub struct RateControl {
     trouble_at: Option<u32>,
     clean: u32,
     reason: &'static str,
+    fec: u32,
 }
 
 impl RateControl {
     /// Starts at `max_bps` (the configured bitrate is the ceiling).
     pub fn new(max_bps: u32) -> Self {
         let max = max_bps.max(MIN_BPS);
-        RateControl { bps: max, max, rtts: VecDeque::new(), lossy_prev: false, hold: 0, trouble_at: None, clean: 0, reason: "start" }
+        RateControl { bps: max, max, rtts: VecDeque::new(), lossy_prev: false, hold: 0, trouble_at: None, clean: 0, reason: "start", fec: FEC_START }
     }
 
+    /// Total bitrate on the wire (video + FEC parity).
     pub fn bps(&self) -> u32 {
         self.bps
+    }
+
+    /// FEC parity percent for [`proto::video::fragment`].
+    pub fn fec_percent(&self) -> u32 {
+        self.fec
+    }
+
+    /// Bitrate for the encoder: the wire rate minus room for FEC parity.
+    pub fn video_bps(&self) -> u32 {
+        (self.bps as u64 * 100 / (100 + self.fec) as u64) as u32
     }
 
     /// Why the rate is what it is, for stats: start, queue, loss, net wait, rtt, burst, hold,
@@ -99,6 +121,7 @@ impl RateControl {
             self.climb();
         }
         self.lossy_prev = lossy;
+        self.fec = if lossy { (self.fec + FEC_UP).min(FEC_MAX) } else { self.fec.saturating_sub(FEC_DOWN).max(FEC_MIN) };
         self.bps
     }
 
@@ -223,6 +246,23 @@ mod tests {
             r.update(&rep(90, 1000, 0, 0.9));
         }
         assert_eq!(r.bps(), MIN_BPS);
+    }
+
+    #[test]
+    fn fec_follows_loss_within_bounds() {
+        let mut r = RateControl::new(20 * M);
+        assert_eq!(r.fec_percent(), 15);
+        assert_eq!(r.video_bps(), 20 * M * 100 / 115);
+        r.update(&rep(90, 1000, 1, 0.0));
+        assert_eq!(r.fec_percent(), 20);
+        for _ in 0..10 {
+            r.update(&rep(90, 1000, 1, 0.0));
+        }
+        assert_eq!(r.fec_percent(), 40);
+        for _ in 0..100 {
+            r.update(&clean(90));
+        }
+        assert_eq!(r.fec_percent(), 10);
     }
 
     #[test]

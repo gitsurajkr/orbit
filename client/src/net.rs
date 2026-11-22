@@ -40,6 +40,8 @@ pub struct NetStats {
     pub lost: AtomicU64,
     pub skipped: AtomicU64,
     pub keyframe_requests: AtomicU64,
+    /// Frames rebuilt by FEC (they'd have been lost without it).
+    pub recovered: AtomicU64,
 }
 
 pub struct Session {
@@ -206,6 +208,9 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
                     match ev {
                         Event::Frame(f) => {
                             stats.frames.fetch_add(1, Ordering::Relaxed);
+                            if f.recovered {
+                                stats.recovered.fetch_add(1, Ordering::Relaxed);
+                            }
                             if gate.admit(f.keyframe) {
                                 if frames_tx.send(f).is_err() {
                                     return;

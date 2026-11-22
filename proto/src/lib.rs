@@ -14,7 +14,7 @@ pub mod stats;
 pub mod video;
 
 /// Bumped whenever any byte layout in this crate changes.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// QUIC ALPN, so an ORBIT client can't talk to something else by accident.
 pub const ALPN: &[u8] = b"orbit/1";
 /// Default UDP port.

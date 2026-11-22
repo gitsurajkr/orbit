@@ -1,91 +1,139 @@
 //! Video over datagrams.
 //!
-//! One encoded frame is split into fragments, each sent as one QUIC datagram:
+//! One encoded frame is split into `data_count` equal-size shards plus `parity_count`
+//! Reed-Solomon parity shards, each sent as one QUIC datagram:
 //!
 //! ```text
 //! u8  DG_VIDEO
 //! u32 frame_id      // +1 per frame sent; a gap means a frame was lost or dropped
-//! u16 frag_index
-//! u16 frag_count
+//! u16 shard_index   // 0..data_count are data, data_count.. are parity
+//! u16 data_count
+//! u16 parity_count
 //! u8  flags         // bit 0: keyframe (IDR)
 //! u64 capture_us    // server's clock when the screen was captured (see clock.rs)
-//! [payload]
+//! u32 frame_len     // bytes of real data (the last data shard is zero-padded)
+//! [shard]
 //! ```
 //!
-//! No FEC and no retransmission in v1: a frame with a missing fragment is dropped whole, the
-//! client asks for a keyframe, and deltas are skipped until it arrives ([`KeyframeGate`]).
+//! FEC: the client rebuilds the frame from **any** `data_count` of the shards, so up to
+//! `parity_count` lost datagrams per frame cost nothing. Data shards go first, so with no loss
+//! the frame completes before its parity arrives (no added delay). A frame that loses more than
+//! that is dropped whole, the client asks for a keyframe, and deltas are skipped until it
+//! arrives ([`KeyframeGate`]). No retransmission.
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub const HEADER_LEN: usize = 18;
+pub const HEADER_LEN: usize = 24;
 pub const FLAG_KEYFRAME: u8 = 1;
+/// reed-solomon-simd's limit on data shards per frame.
+const MAX_DATA_SHARDS: usize = 32768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragHeader {
     pub frame_id: u32,
-    pub frag_index: u16,
-    pub frag_count: u16,
+    pub shard_index: u16,
+    pub data_count: u16,
+    pub parity_count: u16,
     pub flags: u8,
     pub capture_us: u64,
+    pub frame_len: u32,
 }
 
 impl FragHeader {
     pub fn write(&self, out: &mut Vec<u8>) {
         out.push(crate::DG_VIDEO);
         out.extend_from_slice(&self.frame_id.to_le_bytes());
-        out.extend_from_slice(&self.frag_index.to_le_bytes());
-        out.extend_from_slice(&self.frag_count.to_le_bytes());
+        out.extend_from_slice(&self.shard_index.to_le_bytes());
+        out.extend_from_slice(&self.data_count.to_le_bytes());
+        out.extend_from_slice(&self.parity_count.to_le_bytes());
         out.push(self.flags);
         out.extend_from_slice(&self.capture_us.to_le_bytes());
+        out.extend_from_slice(&self.frame_len.to_le_bytes());
     }
 
     pub fn parse(b: &[u8]) -> Result<(FragHeader, &[u8])> {
         ensure!(b.len() >= HEADER_LEN && b[0] == crate::DG_VIDEO, "bad video datagram");
+        let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
         let h = FragHeader {
             frame_id: u32::from_le_bytes(b[1..5].try_into().unwrap()),
-            frag_index: u16::from_le_bytes([b[5], b[6]]),
-            frag_count: u16::from_le_bytes([b[7], b[8]]),
-            flags: b[9],
-            capture_us: u64::from_le_bytes(b[10..18].try_into().unwrap()),
+            shard_index: u16_at(5),
+            data_count: u16_at(7),
+            parity_count: u16_at(9),
+            flags: b[11],
+            capture_us: u64::from_le_bytes(b[12..20].try_into().unwrap()),
+            frame_len: u32::from_le_bytes(b[20..24].try_into().unwrap()),
         };
-        ensure!(h.frag_count > 0 && h.frag_index < h.frag_count, "bad fragment index");
-        Ok((h, &b[HEADER_LEN..]))
+        let total = h.data_count as usize + h.parity_count as usize;
+        ensure!(h.data_count > 0 && h.data_count as usize <= MAX_DATA_SHARDS && h.parity_count > 0, "bad shard counts");
+        ensure!((h.shard_index as usize) < total, "bad shard index");
+        let shard = &b[HEADER_LEN..];
+        ensure!(!shard.is_empty() && shard.len() % 2 == 0, "bad shard size");
+        ensure!(h.frame_len as usize <= h.data_count as usize * shard.len(), "frame length larger than its shards");
+        Ok((h, shard))
     }
 }
 
-/// Number of datagrams a frame of `len` bytes needs at `max_datagram` bytes each.
-pub fn fragment_count(len: usize, max_datagram: usize) -> usize {
-    let payload = max_datagram - HEADER_LEN;
-    len.div_ceil(payload).max(1)
+/// Parity shards for `data` data shards at `fec_percent`: at least 2 once a frame spans 2+
+/// datagrams (internet loss tends to come in pairs), 1 for a single-datagram frame.
+pub fn parity_count(data: usize, fec_percent: u32) -> usize {
+    let floor = if data >= 2 { 2 } else { 1 };
+    (data * fec_percent as usize).div_ceil(100).max(floor)
 }
 
-/// Splits one encoded frame into datagrams of at most `max_datagram` bytes.
-pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, data: &[u8], max_datagram: usize) -> Result<Vec<Vec<u8>>> {
+/// Largest even shard that fits in one datagram after the header.
+fn shard_capacity(max_datagram: usize) -> usize {
+    (max_datagram - HEADER_LEN) & !1
+}
+
+/// Data shards a frame of `len` bytes needs at `max_datagram` bytes per datagram.
+fn data_count(len: usize, max_datagram: usize) -> usize {
+    len.div_ceil(shard_capacity(max_datagram)).max(1)
+}
+
+/// Datagrams (data + parity) a frame of `len` bytes is sent as.
+pub fn datagram_count(len: usize, max_datagram: usize, fec_percent: u32) -> usize {
+    let k = data_count(len, max_datagram);
+    k + parity_count(k, fec_percent)
+}
+
+/// Splits one encoded frame into data + parity datagrams of at most `max_datagram` bytes.
+pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, data: &[u8], max_datagram: usize, fec_percent: u32) -> Result<Vec<Vec<u8>>> {
     ensure!(max_datagram > HEADER_LEN + 64, "datagram size {max_datagram} too small");
-    let payload = max_datagram - HEADER_LEN;
-    let count = fragment_count(data.len(), max_datagram);
-    ensure!(count <= u16::MAX as usize, "frame of {} bytes too big", data.len());
+    let k = data_count(data.len(), max_datagram);
+    let m = parity_count(k, fec_percent);
+    ensure!(k <= MAX_DATA_SHARDS && k + m <= u16::MAX as usize, "frame of {} bytes too big", data.len());
+    // Equal-size even shards (Reed-Solomon needs both); the last one is zero-padded.
+    let shard_len = (data.len().div_ceil(k).max(1) + 1) & !1;
+    let shards: Vec<Vec<u8>> = (0..k)
+        .map(|i| {
+            let mut v = data[(i * shard_len).min(data.len())..((i + 1) * shard_len).min(data.len())].to_vec();
+            v.resize(shard_len, 0);
+            v
+        })
+        .collect();
+    let parity = reed_solomon_simd::encode(k, m, &shards).context("FEC encode")?;
     let flags = if keyframe { FLAG_KEYFRAME } else { 0 };
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let chunk = &data[(i * payload).min(data.len())..((i + 1) * payload).min(data.len())];
-        let mut d = Vec::with_capacity(HEADER_LEN + chunk.len());
-        FragHeader { frame_id, frag_index: i as u16, frag_count: count as u16, flags, capture_us }.write(&mut d);
-        d.extend_from_slice(chunk);
+    let mut out = Vec::with_capacity(k + m);
+    for (i, shard) in shards.iter().chain(parity.iter()).enumerate() {
+        let mut d = Vec::with_capacity(HEADER_LEN + shard_len);
+        FragHeader { frame_id, shard_index: i as u16, data_count: k as u16, parity_count: m as u16, flags, capture_us, frame_len: data.len() as u32 }.write(&mut d);
+        d.extend_from_slice(shard);
         out.push(d);
     }
     Ok(out)
 }
 
-/// A frame rebuilt from all its fragments.
+/// A frame rebuilt from its shards.
 #[derive(Debug)]
 pub struct Frame {
     pub id: u32,
     pub keyframe: bool,
     pub capture_us: u64,
     pub data: Vec<u8>,
+    /// True if FEC rebuilt missing data shards (the frame would have been lost without it).
+    pub recovered: bool,
     /// When the first fragment arrived; `complete_at - first_at` is time spent on the wire
     /// spreading out one frame (big keyframes show up here).
     pub first_at: Instant,
@@ -102,12 +150,42 @@ pub enum Event {
 struct Partial {
     keyframe: bool,
     capture_us: u64,
-    frags: Vec<Option<Vec<u8>>>,
+    frame_len: usize,
+    data_count: usize,
+    parity_count: usize,
+    shard_len: usize,
+    shards: Vec<Option<Vec<u8>>>,
     got: usize,
+    data_got: usize,
     first_at: Instant,
 }
 
-/// Rebuilds frames from fragments and reports losses. Frames are delivered in id order;
+impl Partial {
+    /// Joins the data shards, rebuilding missing ones from parity first if needed.
+    /// Returns the frame and whether FEC was needed.
+    fn assemble(self) -> Result<(Vec<u8>, bool)> {
+        let k = self.data_count;
+        let recovered = self.data_got < k;
+        let mut data_shards = self.shards;
+        let parity = data_shards.split_off(k);
+        if recovered {
+            let present = data_shards.iter().enumerate().filter_map(|(i, s)| s.as_deref().map(|s| (i, s)));
+            let recovery = parity.iter().enumerate().filter_map(|(i, s)| s.as_deref().map(|s| (i, s)));
+            let restored = reed_solomon_simd::decode(k, self.parity_count, present, recovery).context("FEC decode")?;
+            for (i, s) in restored {
+                data_shards[i] = Some(s);
+            }
+        }
+        let mut data = Vec::with_capacity(k * self.shard_len);
+        for s in data_shards {
+            data.extend_from_slice(&s.context("shard missing after FEC")?);
+        }
+        data.truncate(self.frame_len);
+        Ok((data, recovered))
+    }
+}
+
+/// Rebuilds frames from shards and reports losses. Frames are delivered in id order;
 /// once a newer frame completes, every older unfinished frame is declared lost (it would be
 /// stale anyway). An unfinished frame is also declared lost after `timeout`, so the last
 /// frame before the screen goes still can't hang forever waiting for a successor.
@@ -118,7 +196,7 @@ pub struct Reassembler {
     timeout: Duration,
 }
 
-/// Bounds memory if fragments of many frames arrive without any completing.
+/// Bounds memory if shards of many frames arrive without any completing.
 const MAX_PARTIAL: usize = 64;
 
 impl Reassembler {
@@ -127,41 +205,49 @@ impl Reassembler {
     }
 
     pub fn push(&mut self, dgram: &[u8], now: Instant, out: &mut Vec<Event>) -> Result<()> {
-        let (h, payload) = FragHeader::parse(dgram)?;
+        let (h, shard) = FragHeader::parse(dgram)?;
         if self.done_through.is_some_and(|d| h.frame_id <= d) {
-            return Ok(()); // late fragment of a frame already finished or given up
+            return Ok(()); // late shard of a frame already finished or given up (often parity)
         }
+        let (k, m) = (h.data_count as usize, h.parity_count as usize);
         let p = self.partial.entry(h.frame_id).or_insert_with(|| Partial {
             keyframe: h.flags & FLAG_KEYFRAME != 0,
             capture_us: h.capture_us,
-            frags: vec![None; h.frag_count as usize],
+            frame_len: h.frame_len as usize,
+            data_count: k,
+            parity_count: m,
+            shard_len: shard.len(),
+            shards: vec![None; k + m],
             got: 0,
+            data_got: 0,
             first_at: now,
         });
-        ensure!(p.frags.len() == h.frag_count as usize, "fragment count changed within frame {}", h.frame_id);
-        let slot = &mut p.frags[h.frag_index as usize];
-        if slot.is_none() {
-            *slot = Some(payload.to_vec());
+        ensure!(
+            p.data_count == k && p.parity_count == m && p.shard_len == shard.len() && p.frame_len == h.frame_len as usize,
+            "shard layout changed within frame {}",
+            h.frame_id
+        );
+        let i = h.shard_index as usize;
+        if p.shards[i].is_none() {
+            p.shards[i] = Some(shard.to_vec());
             p.got += 1;
+            if i < k {
+                p.data_got += 1;
+            }
         }
-        if p.got == p.frags.len() {
+        if p.got >= p.data_count {
             let p = self.partial.remove(&h.frame_id).unwrap();
             if let Some(prev) = h.frame_id.checked_sub(1) {
                 self.give_up_through(prev, out);
             }
-            self.done_through = Some(h.frame_id);
-            let mut data = Vec::with_capacity(p.frags.iter().map(|f| f.as_ref().map_or(0, Vec::len)).sum());
-            for f in p.frags {
-                data.extend_from_slice(&f.unwrap());
+            let (keyframe, capture_us, first_at) = (p.keyframe, p.capture_us, p.first_at);
+            match p.assemble() {
+                Ok((data, recovered)) => {
+                    self.done_through = Some(h.frame_id);
+                    out.push(Event::Frame(Frame { id: h.frame_id, keyframe, capture_us, data, recovered, first_at, complete_at: now }));
+                }
+                Err(_) => self.give_up_through(h.frame_id, out),
             }
-            out.push(Event::Frame(Frame {
-                id: h.frame_id,
-                keyframe: p.keyframe,
-                capture_us: p.capture_us,
-                data,
-                first_at: p.first_at,
-                complete_at: now,
-            }));
         } else if self.partial.len() > MAX_PARTIAL {
             let oldest = *self.partial.keys().next().unwrap();
             self.give_up_through(oldest, out);
@@ -261,10 +347,11 @@ mod tests {
     use super::*;
 
     const MTU: usize = 1200;
+    const FEC: u32 = 15;
 
     fn frame(id: u32, len: usize, key: bool) -> Vec<Vec<u8>> {
         let data: Vec<u8> = (0..len).map(|i| (i * 7 + id as usize) as u8).collect();
-        fragment(id, 1000 + id as u64, key, &data, MTU).unwrap()
+        fragment(id, 1000 + id as u64, key, &data, MTU, FEC).unwrap()
     }
 
     fn frames(ev: &[Event]) -> Vec<u32> {
@@ -279,8 +366,8 @@ mod tests {
     fn fragments_fit_and_rebuild_exactly() {
         for len in [0, 1, MTU - HEADER_LEN, MTU - HEADER_LEN + 1, 300_000] {
             let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
-            let grams = fragment(5, 42, true, &data, MTU).unwrap();
-            assert_eq!(grams.len(), fragment_count(len, MTU));
+            let grams = fragment(5, 42, true, &data, MTU, FEC).unwrap();
+            assert_eq!(grams.len(), datagram_count(len, MTU, FEC));
             assert!(grams.iter().all(|g| g.len() <= MTU));
             let mut r = Reassembler::new(Duration::from_millis(100));
             let mut ev = Vec::new();
@@ -296,6 +383,72 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    fn deliver(grams: &[Vec<u8>], skip: &[usize]) -> Vec<Event> {
+        let mut r = Reassembler::new(Duration::from_secs(10));
+        let mut ev = Vec::new();
+        for (i, g) in grams.iter().enumerate() {
+            if !skip.contains(&i) {
+                r.push(g, Instant::now(), &mut ev).unwrap();
+            }
+        }
+        ev
+    }
+
+    #[test]
+    fn parity_count_rules() {
+        assert_eq!(parity_count(1, 15), 1); // single-datagram frame
+        assert_eq!(parity_count(2, 15), 2); // floor of 2
+        assert_eq!(parity_count(10, 15), 2);
+        assert_eq!(parity_count(20, 15), 3);
+        assert_eq!(parity_count(100, 40), 40);
+    }
+
+    #[test]
+    fn fec_rebuilds_up_to_parity_count_lost_datagrams_anywhere() {
+        let data: Vec<u8> = (0..30_001).map(|i| (i * 13) as u8).collect(); // odd length: padding
+        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let k = data.len().div_ceil(shard_capacity(MTU));
+        let m = grams.len() - k;
+        assert_eq!(m, parity_count(k, FEC));
+        // first m, last m, spread out, a data+parity mix
+        for skip in [(0..m).collect::<Vec<_>>(), (k + m - m..k + m).collect(), (0..m).map(|i| i * 5).collect(), vec![3, k]] {
+            match &deliver(&grams, &skip)[..] {
+                [Event::Frame(f)] => {
+                    assert_eq!(f.data, data, "skip {skip:?}");
+                    assert_eq!(f.recovered, skip.iter().any(|&i| i < k), "skip {skip:?}");
+                }
+                other => panic!("skip {skip:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn too_many_lost_datagrams_lose_the_frame() {
+        let data = vec![7u8; 30_000];
+        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let k = data.len().div_ceil(shard_capacity(MTU));
+        let m = grams.len() - k;
+        let skip: Vec<usize> = (0..=m).collect(); // one more than parity can cover
+        assert!(frames(&deliver(&grams, &skip)).is_empty());
+    }
+
+    #[test]
+    fn clean_frame_completes_before_its_parity() {
+        let data = vec![1u8; 10_000];
+        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let k = data.len().div_ceil(shard_capacity(MTU));
+        let mut r = Reassembler::new(Duration::from_secs(1));
+        let mut ev = Vec::new();
+        for g in &grams[..k] {
+            r.push(g, Instant::now(), &mut ev).unwrap();
+        }
+        assert!(matches!(&ev[..], [Event::Frame(f)] if !f.recovered && f.data == data));
+        for g in &grams[k..] {
+            r.push(g, Instant::now(), &mut ev).unwrap(); // late parity: ignored
+        }
+        assert_eq!(ev.len(), 1);
     }
 
     #[test]
@@ -364,7 +517,7 @@ mod tests {
         let mut ev = Vec::new();
         assert!(r.push(&[crate::DG_VIDEO; 5], Instant::now(), &mut ev).is_err());
         let mut g = frame(0, 3000, false)[0].clone();
-        g[7] = 0; // frag_count = 0 (low byte) with index 0 -> count becomes small/invalid
+        g[7] = 0; // data_count = 0
         g[8] = 0;
         assert!(r.push(&g, Instant::now(), &mut ev).is_err());
     }
