@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 fn bench(args: &Args, mon: capture::MonitorInfo) -> Result<()> {
     let mut p = video::Pipeline::new(mon, args.fps, (args.mbps * 1e6) as u32)?;
     let m = p.monitor().clone();
-    println!("capturing {} {}x{} on '{}', {} fps cap, {} Mbit/s", m.device_name, m.width, m.height, m.adapter_name, args.fps, args.mbps);
+    println!("capturing {} {}x{} on '{}' via {}, {} fps cap, {} Mbit/s", m.device_name, m.width, m.height, m.adapter_name, p.capture_mode(), args.fps, args.mbps);
     let mut dump = args.dump.as_ref().map(std::fs::File::create).transpose()?;
     let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut buf = Vec::with_capacity(1 << 20);

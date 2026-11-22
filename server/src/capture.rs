@@ -210,12 +210,23 @@ impl Duplicator {
         // On the secure desktop (UAC, Ctrl+Alt+Del) duplication is refused for a while; keep
         // trying instead of giving up.
         for attempt in 0.. {
-            match unsafe { self.output.DuplicateOutput(&gpu.device) } {
+            let mut r = unsafe { self.output.DuplicateOutput(&gpu.device) };
+            // Some systems refuse the old call but accept the newer DuplicateOutput1 (Win10 1703+).
+            if matches!(&r, Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED) {
+                if let Ok(o5) = self.output.cast::<IDXGIOutput5>() {
+                    if let Ok(d) = unsafe { o5.DuplicateOutput1(&gpu.device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) } {
+                        r = Ok(d);
+                    }
+                }
+            }
+            match r {
                 Ok(d) => {
                     self.dup = Some(d);
                     return Ok(());
                 }
-                Err(e) if attempt < 30 && (e.code() == windows::Win32::Foundation::E_ACCESSDENIED || e.code() == DXGI_ERROR_UNSUPPORTED || e.code() == DXGI_ERROR_SESSION_DISCONNECTED) => {
+                // Not retried: DXGI_ERROR_UNSUPPORTED is permanent (Remote Desktop session, screen
+                // on another GPU, basic display driver); the caller falls back to GDI capture.
+                Err(e) if attempt < 30 && (e.code() == windows::Win32::Foundation::E_ACCESSDENIED || e.code() == DXGI_ERROR_SESSION_DISCONNECTED) => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) if e.code() == windows::Win32::Foundation::E_ACCESSDENIED => {
@@ -251,5 +262,88 @@ impl Duplicator {
         }
         unsafe { dup.ReleaseFrame()? };
         Ok(if changed { Grab::Frame } else { Grab::Timeout })
+    }
+}
+
+/// True if `e` is Windows refusing Desktop Duplication on this system for good.
+pub fn is_duplication_unsupported(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<windows::core::Error>().is_some_and(|w| w.code() == DXGI_ERROR_UNSUPPORTED))
+}
+
+/// True if this process runs in a Microsoft Remote Desktop session.
+pub fn in_remote_desktop() -> bool {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_REMOTESESSION) != 0 }
+}
+
+/// Compatibility capture with GDI (BitBlt), for systems where Desktop Duplication is refused:
+/// Remote Desktop sessions, a screen on a different GPU than the app, basic display drivers.
+/// Copies the screen into a DIB in system memory, then uploads it into the encoder's texture.
+/// Slower than duplication (a few ms per frame, CPU copy) and has no "changed" signal, so it
+/// captures at the frame-rate cap.
+pub struct GdiCapture {
+    screen: windows::Win32::Graphics::Gdi::HDC,
+    mem: windows::Win32::Graphics::Gdi::HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    old: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    bits: *mut std::ffi::c_void,
+    pub mon: MonitorInfo,
+}
+
+impl GdiCapture {
+    pub fn new(mon: MonitorInfo) -> Result<GdiCapture> {
+        use windows::Win32::Graphics::Gdi::*;
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                bail!("GetDC failed");
+            }
+            let mem = CreateCompatibleDC(screen);
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: mon.width as i32,
+                    biHeight: -(mon.height as i32), // top-down, same row order as a texture
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = match CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = DeleteDC(mem);
+                    ReleaseDC(None, screen);
+                    return Err(e).context("CreateDIBSection");
+                }
+            };
+            let old = SelectObject(mem, bitmap);
+            Ok(GdiCapture { screen, mem, bitmap, old, bits, mon })
+        }
+    }
+
+    /// Copies the monitor's current image into `dst` (a BGRA texture on `gpu`).
+    pub fn grab(&mut self, gpu: &Gpu, dst: &ID3D11Texture2D) -> Result<()> {
+        use windows::Win32::Graphics::Gdi::*;
+        unsafe {
+            BitBlt(self.mem, 0, 0, self.mon.width as i32, self.mon.height as i32, self.screen, self.mon.left, self.mon.top, SRCCOPY | CAPTUREBLT).context("BitBlt (is the screen locked?)")?;
+            let _ = GdiFlush();
+            gpu.ctx.UpdateSubresource(dst, 0, None, self.bits, self.mon.width * 4, 0);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GdiCapture {
+    fn drop(&mut self) {
+        use windows::Win32::Graphics::Gdi::*;
+        unsafe {
+            SelectObject(self.mem, self.old);
+            let _ = DeleteObject(self.bitmap);
+            let _ = DeleteDC(self.mem);
+            ReleaseDC(None, self.screen);
+        }
     }
 }

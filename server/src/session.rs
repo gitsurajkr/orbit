@@ -251,13 +251,18 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 let st = conn.stats();
                 let (fps, mbit, enc, rtt) = (frames as f64 / secs, mbit_per_s(bytes, secs), enc_ms.take(), conn.rtt().as_secs_f64() * 1e3);
                 println!(
-                    "send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | rtt {rtt:.1} ms | lost pkts {}",
-                    if p.bridged() { format!("bridge ms {} | ", bridge_ms.take()) } else { String::new() },
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | rtt {rtt:.1} ms | lost pkts {}",
+                    p.capture_mode(),
+                    if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
                     st.path.lost_packets - lost_prev,
                 );
                 let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
+                let mode = match p.capture_mode() {
+                    "gdi" => if crate::capture::in_remote_desktop() { "COMPAT CAPTURE (REMOTE DESKTOP) · " } else { "COMPAT CAPTURE · " },
+                    _ => "",
+                };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · DROPPED {dropped}"))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · DROPPED {dropped}"))
                 });
                 lost_prev = st.path.lost_packets;
                 (frames, bytes, keys, dropped) = (0, 0, 0, 0);
