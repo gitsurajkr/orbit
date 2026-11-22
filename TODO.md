@@ -2,9 +2,21 @@
 
 ## Next
 - [x] Auto-start sharing when Windows starts (SHARE tab checkbox; needs Windows auto sign-in).
-- [ ] Publish the first release with the updater (v0.1.2's tag build never started; release v0.1.3).
+- [x] Publish the first release with the updater (v0.1.3, then v0.1.4 with the UPDATE button).
+- [ ] **Set up the sharing PC for zero-touch restarts** (one-time, on the PC to be controlled):
+  - [ ] Install ORBIT v0.1.4+, SHARE tab → tick **START SHARING WHEN WINDOWS STARTS**
+  - [ ] Auto sign-in: Microsoft Autologon (learn.microsoft.com/sysinternals/downloads/autologon)
+        → enter Windows password → Enable
+  - [ ] Tailscale tray → Preferences → **Run unattended**
+  - [ ] Settings → Accounts → Sign-in options → require sign-in again → **Never**
+  - [ ] Settings → System → Power → sleep → **Never** (screen off is fine)
+  - [ ] Laptop only: keep it plugged in; Power Options → closing the lid → **Do nothing** (plugged in)
+  - [ ] Test: restart the PC, touch nothing, connect from the other PC with ORBIT
+- [ ] Workstation: log Windows Tailscale into the same account as the laptop (it isn't on the
+      tailnet yet; `tailscale status` on the laptop should list it as **windows**).
 - [ ] First real test 4070S workstation → laptop over Tailscale: record fps / latency / drops,
       verify colors and mouse/keyboard control.
+- [ ] First real in-app update: on a PC with v0.1.3, click UPDATE → installs v0.1.4 and reopens.
 
 ## Later
 - [ ] Adaptive bitrate (milestone 4): lower/raise bitrate from drops, loss and RTT
