@@ -33,6 +33,10 @@ pub struct Release {
 #[derive(Clone, Debug)]
 pub enum State {
     Idle,
+    /// A manual check is running.
+    Checking,
+    /// A manual check found nothing newer (shown briefly).
+    UpToDate(Instant),
     Available(Release),
     Downloading { version: String },
     Failed(String),
@@ -135,8 +139,45 @@ impl Updater {
         let s = self.state.lock().unwrap().clone();
         match &s {
             State::Available(r) if self.dismissed.as_deref() == Some(r.version.as_str()) => State::Idle,
+            State::UpToDate(t) if t.elapsed() > Duration::from_secs(4) => State::Idle,
             _ => s,
         }
+    }
+
+    /// True if a newer version is known (even if its banner was dismissed).
+    pub fn update_known(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), State::Available(_))
+    }
+
+    /// The UPDATE button: check GitHub now and always report the result.
+    pub fn check_now(&mut self, ctx: &eframe::egui::Context) {
+        {
+            let mut st = self.state.lock().unwrap();
+            match &*st {
+                State::Checking | State::Downloading { .. } => return,
+                State::Available(_) => {
+                    // Already known: just bring the banner back.
+                    self.dismissed = None;
+                    return;
+                }
+                _ => *st = State::Checking,
+            }
+        }
+        self.dismissed = None;
+        self.last_check = Some(Instant::now());
+        let (state, ctx) = (self.state.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let next = match check() {
+                Ok(Some(r)) => State::Available(r),
+                Ok(None) => State::UpToDate(Instant::now()),
+                Err(e) => State::Failed(format!("{e:#}")),
+            };
+            *state.lock().unwrap() = next;
+            ctx.request_repaint();
+            // Repaint again when the "up to date" note should disappear.
+            std::thread::sleep(Duration::from_millis(4100));
+            ctx.request_repaint();
+        });
     }
 
     pub fn progress(&self) -> (u64, u64) {
@@ -148,7 +189,7 @@ impl Updater {
         if self.last_check.is_some_and(|t| t.elapsed() < CHECK_EVERY) {
             return;
         }
-        if matches!(*self.state.lock().unwrap(), State::Downloading { .. }) {
+        if matches!(*self.state.lock().unwrap(), State::Downloading { .. } | State::Checking) {
             return;
         }
         self.last_check = Some(Instant::now());
@@ -160,7 +201,12 @@ impl Updater {
                 // A failed check (offline, rate-limited) is silent; we try again later.
                 Err(_) => return,
             };
-            *state.lock().unwrap() = next;
+            let mut st = state.lock().unwrap();
+            // Don't overwrite a manual check's result or a download in progress.
+            if matches!(*st, State::Idle | State::Available(_) | State::UpToDate(_)) {
+                *st = next;
+            }
+            drop(st);
             ctx.request_repaint();
         });
     }

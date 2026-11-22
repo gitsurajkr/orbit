@@ -201,7 +201,7 @@ impl eframe::App for App {
         }
         widgets::background(ctx);
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-            title_bar(ui, ctx);
+            title_bar(ui, ctx, &mut self.updater);
             update_banner(ui, ctx, &mut self.updater);
             ui.add_space(8.0);
             header(ui);
@@ -374,7 +374,7 @@ fn label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).font(FontId::monospace(10.5)).color(gray(140)));
 }
 
-fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context) {
+fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update::Updater) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), TITLE_H), Sense::click_and_drag());
     if resp.drag_started() {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
@@ -384,6 +384,34 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context) {
     p.circle_stroke(pos2(rect.left() + 20.0, rect.center().y), 6.0, stk(1.4, W));
     p.circle_filled(pos2(rect.left() + 20.0, rect.center().y), 2.0, W);
     p.text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, spaced("ORBIT"), FontId::monospace(12.0), gray(200));
+    // UPDATE button, left of the window buttons; a pulsing dot when a new version is known
+    {
+        let r = egui::Rect::from_min_size(pos2(rect.right() - 92.0 - 100.0, rect.top() + 7.0), vec2(92.0, TITLE_H - 15.0));
+        let b = ui.interact(r, ui.id().with("update_btn"), Sense::click());
+        let hov = b.hovered();
+        if hov {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let known = up.update_known();
+        let (bg, fg) = if hov { (W, B) } else { (B, gray(210)) };
+        ui.painter().rect_filled(r, 0.0, bg);
+        ui.painter().rect_stroke(r, 0.0, stk(1.0, if hov || known { W } else { gray(110) }));
+        let checking = matches!(up.state(), crate::update::State::Checking);
+        let label = if checking { "CHECKING" } else { "UPDATE" };
+        let text_x = if known { r.center().x + 5.0 } else { r.center().x };
+        ui.painter().text(pos2(text_x, r.center().y), Align2::CENTER_CENTER, label, FontId::monospace(11.0), fg);
+        if known {
+            let t = ctx.input(|i| i.time) as f32;
+            let a = 0.45 + 0.55 * (0.5 + 0.5 * (t * 5.0).sin());
+            let col = if hov { B } else { white_a(a) };
+            ui.painter().circle_filled(pos2(r.left() + 11.0, r.center().y), 3.5, col);
+            ctx.request_repaint();
+        }
+        if b.clicked() {
+            up.check_now(ctx);
+        }
+        b.on_hover_text(format!("ORBIT v{} · check GitHub for a new version", crate::update::CURRENT));
+    }
     // window buttons
     for i in 0..2 {
         let r = egui::Rect::from_min_size(pos2(rect.right() - 46.0 * (i as f32 + 1.0), rect.top()), vec2(46.0, TITLE_H - 1.0));
@@ -446,6 +474,13 @@ fn update_banner(ui: &mut egui::Ui, ctx: &egui::Context, up: &mut crate::update:
                     }
                 }
             }
+        }
+        State::Checking => {
+            p.text(left, Align2::LEFT_CENTER, "CHECKING FOR UPDATES...", font.clone(), B);
+            ctx.request_repaint();
+        }
+        State::UpToDate(_) => {
+            p.text(left, Align2::LEFT_CENTER, format!("ORBIT v{} IS UP TO DATE", crate::update::CURRENT), font.clone(), B);
         }
         State::Downloading { version } => {
             let (done, total) = up.progress();
