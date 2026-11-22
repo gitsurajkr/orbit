@@ -21,8 +21,8 @@
 ## Later
 - [ ] Show "TAILSCALE RELAY (city) · +xx ms" in ORBIT when the link to the other PC isn't
       direct (from `tailscale status --json`), so high latency explains itself.
-- [ ] Adaptive bitrate (milestone 4): lower/raise bitrate from drops, loss and RTT
-      (`Encoder::set_bitrate` already exists).
+- [x] Adaptive bitrate (milestone 4): server/src/rate.rs, from RTT, loss and net wait.
+- [ ] Tune adaptive bitrate on the real relayed link (recovery after a deep cut is slow).
 - [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).
 - [ ] Pairing / auth (milestone 5): PIN on first connect, verify the server certificate.
 - [ ] Clipboard sync.

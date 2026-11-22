@@ -5,6 +5,7 @@ pub mod capture;
 pub mod input;
 pub mod net;
 pub mod nvenc;
+pub mod rate;
 pub mod session;
 pub mod video;
 

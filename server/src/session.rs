@@ -11,6 +11,7 @@
 
 use crate::capture::MonitorInfo;
 use crate::input::Input;
+use crate::rate::{RateControl, Report};
 use crate::video::Pipeline;
 use anyhow::{bail, ensure, Context, Result};
 use proto::clock::now_us;
@@ -224,9 +225,11 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
 
 fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let mut frame_id: u32 = 0;
-    // Allowed bytes waiting in quinn before we drop a frame instead of queueing it: ~2 frames.
-    let frame_budget = (s.bitrate_bps / 8 / s.fps.max(1)) as usize;
-    let backlog_limit = (2 * frame_budget).max(64 * 1024);
+    // Adaptive bitrate: the configured bitrate is the ceiling (see rate.rs).
+    let mut rate = RateControl::new(s.bitrate_bps);
+    // Allowed bytes waiting in quinn before we stop encoding: ~2 frames at the current bitrate.
+    let backlog_limit_for = |bps: u32| (2 * (bps / 8 / s.fps.max(1)) as usize).max(64 * 1024);
+    let mut backlog_limit = backlog_limit_for(rate.bps());
     let interval = Duration::from_secs_f64(1.0 / s.fps.max(1) as f64);
     let mut buf = Vec::with_capacity(1 << 20);
     let mut ticker = Ticker::new(Duration::from_secs(1));
@@ -235,11 +238,12 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let mut net_wait = Duration::ZERO;
     let (mut enc_ms, mut bridge_ms) = (Dist::default(), Dist::default());
     let mut lost_prev = conn.stats().path.lost_packets;
+    let mut sent_prev = conn.stats().path.sent_packets;
 
     'pipeline: while !shared.stop.load(Ordering::Acquire) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
-        let mut p = match Pipeline::new(s.monitor.clone(), s.fps, s.bitrate_bps) {
+        let mut p = match Pipeline::new(s.monitor.clone(), s.fps, rate.bps()) {
             Ok(p) => {
                 shared.status.update(|i| i.error = None);
                 p
@@ -259,11 +263,21 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 let st = conn.stats();
                 let (fps, mbit, enc, rtt) = (frames as f64 / secs, mbit_per_s(bytes, secs), enc_ms.take(), conn.rtt().as_secs_f64() * 1e3);
                 let wait_ms = net_wait.as_secs_f64() * 1e3;
+                let lost = st.path.lost_packets - lost_prev;
+                let report = Report { rtt: conn.rtt(), sent_packets: st.path.sent_packets - sent_prev, lost_packets: lost, net_wait: net_wait.as_secs_f64() / secs };
+                let (old_bps, new_bps) = (rate.bps(), rate.update(&report));
+                if new_bps != old_bps {
+                    match p.encoder().set_bitrate(new_bps) {
+                        Ok(()) => backlog_limit = backlog_limit_for(new_bps),
+                        Err(e) => eprintln!("set bitrate {new_bps}: {e:#}"),
+                    }
+                }
+                let target = new_bps as f64 / 1e6;
                 println!(
-                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {}",
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {lost}",
                     p.capture_mode(),
+                    rate.reason(),
                     if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
-                    st.path.lost_packets - lost_prev,
                 );
                 let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
                 let mode = match p.capture_mode() {
@@ -271,9 +285,10 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     _ => "",
                 };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}"))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}"))
                 });
                 lost_prev = st.path.lost_packets;
+                sent_prev = st.path.sent_packets;
                 (frames, bytes, keys, dropped, net_wait) = (0, 0, 0, 0, Duration::ZERO);
             }
             // Backpressure: while quinn still holds more than ~2 frames of unsent data, don't

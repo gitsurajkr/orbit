@@ -102,7 +102,7 @@ Client, once a second:
   with `relay "bom"` (or another city) instead of an address, every packet goes through
   Tailscale's relay server and adds tens of ms. Carrier-grade NAT (an ISP address starting with
   100.64-100.127) is the usual cause; IPv6 on both networks or the same Wi-Fi usually fixes it.
-- Fixed bitrate (no adaptive bitrate yet), no FEC: a lost packet costs one keyframe.
+- Adaptive bitrate from RTT, loss and send-queue waits (the BITRATE setting is the ceiling); no FEC yet: a lost packet costs one keyframe.
 - One monitor (`--monitor N`); no clipboard; remote cursor shape isn't shown (the client's own
   arrow cursor is used, which is what makes the pointer feel instant).
 - Win key, Alt+Tab, Ctrl+Esc are taken by the client's Windows, not forwarded.
