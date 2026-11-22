@@ -125,9 +125,61 @@ pub async fn serve(endpoint: quinn::Endpoint, settings: Settings, status: Arc<St
     Ok(())
 }
 
+/// Stops a running server, and knows which endpoint it is using right now.
+#[derive(Default)]
+pub struct Control {
+    stopping: AtomicBool,
+    endpoint: Mutex<Option<quinn::Endpoint>>,
+}
+
+impl Control {
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(e) = self.endpoint.lock().unwrap().as_ref() {
+            e.close(0u32.into(), b"server stopped");
+        }
+    }
+}
+
+/// Like [`serve`], but keeps listening until [`Control::stop`].
+///
+/// quinn's endpoint can die by itself: its receive task exits on any socket error other than
+/// "connection reset" (Windows hands out such errors while network adapters come and go, e.g.
+/// right after boot). `accept()` then returns `None` as if sharing had been stopped, and the
+/// app would sit at "waiting" with nothing listening. So when `serve` returns without a stop,
+/// a fresh endpoint is bound on the same address.
+pub async fn serve_until_stopped(mut endpoint: quinn::Endpoint, bind: std::net::SocketAddr, settings: Settings, status: Arc<Status>, ctl: Arc<Control>) -> Result<()> {
+    loop {
+        *ctl.endpoint.lock().unwrap() = Some(endpoint.clone());
+        if ctl.stopping.load(Ordering::Acquire) {
+            endpoint.close(0u32.into(), b"server stopped"); // stop raced with the swap above
+        }
+        serve(endpoint, settings.clone(), status.clone()).await?;
+        if ctl.stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        eprintln!("listener on {bind} stopped by itself (network error); starting a new one");
+        status.update(|i| i.error = Some("listener restarted after a network error".into()));
+        ctl.endpoint.lock().unwrap().take(); // release the dead socket so the port is free
+        endpoint = loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if ctl.stopping.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match crate::net::endpoint(bind) {
+                Ok(e) => break e,
+                Err(e) => {
+                    eprintln!("restarting listener: {e:#}; retrying");
+                    status.update(|i| i.error = Some(format!("restarting listener: {e:#}")));
+                }
+            }
+        };
+    }
+}
+
 /// A server running on its own threads, for the UI.
 pub struct ServerHandle {
-    endpoint: quinn::Endpoint,
+    ctl: Arc<Control>,
     thread: Option<std::thread::JoinHandle<()>>,
     pub status: Arc<Status>,
     pub bind: std::net::SocketAddr,
@@ -141,17 +193,18 @@ impl ServerHandle {
             crate::net::endpoint(bind)?
         };
         let status = Arc::new(Status::default());
-        let (ep, st) = (endpoint.clone(), status.clone());
+        let ctl = Arc::new(Control::default());
+        let (st, c) = (status.clone(), ctl.clone());
         let thread = std::thread::Builder::new().name("orbit-server".into()).spawn(move || {
-            if let Err(e) = rt.block_on(serve(ep, settings, st.clone())) {
+            if let Err(e) = rt.block_on(serve_until_stopped(endpoint, bind, settings, st.clone(), c)) {
                 st.update(|i| i.error = Some(format!("{e:#}")));
             }
         })?;
-        Ok(ServerHandle { endpoint, thread: Some(thread), status, bind })
+        Ok(ServerHandle { ctl, thread: Some(thread), status, bind })
     }
 
     pub fn stop(mut self) {
-        self.endpoint.close(0u32.into(), b"server stopped");
+        self.ctl.stop();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }

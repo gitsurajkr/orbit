@@ -60,7 +60,7 @@ fn main() -> Result<()> {
             "orbit-server listening on {bind} | {} {}x{} on '{}' | {} fps cap | {} Mbit/s",
             mon.device_name, mon.width, mon.height, mon.adapter_name, args.fps, args.mbps
         );
-        session::serve(endpoint, settings, Default::default()).await
+        session::serve_until_stopped(endpoint, bind, settings, Default::default(), Default::default()).await
     })
 }
 
