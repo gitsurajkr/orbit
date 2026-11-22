@@ -1,8 +1,8 @@
 # ORBIT TODO
 
 ## Next
-- [ ] **Auto-start sharing when Windows starts**: a setting in the SHARE tab; on login, ORBIT
-      starts minimized (tray) and begins sharing, so the workstation needs no manual step.
+- [x] Auto-start sharing when Windows starts (SHARE tab checkbox; needs Windows auto sign-in).
+- [ ] Publish the first release with the updater (v0.1.2's tag build never started; release v0.1.3).
 - [ ] First real test 4070S workstation → laptop over Tailscale: record fps / latency / drops,
       verify colors and mouse/keyboard control.
 

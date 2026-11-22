@@ -130,6 +130,7 @@ dependencies = [
  "server",
  "sha2",
  "ureq",
+ "windows",
  "winresource",
 ]
 

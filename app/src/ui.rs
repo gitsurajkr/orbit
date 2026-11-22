@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WIDTH: f32 = 460.0;
-const HEIGHT: f32 = 690.0;
+const HEIGHT: f32 = 716.0;
 const TITLE_H: f32 = 38.0;
 
-pub fn run() -> Result<(), String> {
+pub fn run(launched_at_login: bool) -> Result<(), String> {
     let icon = egui::IconData { rgba: crate::icon::orbit_icon_rgba(64), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -24,7 +24,7 @@ pub fn run() -> Result<(), String> {
         centered: true,
         ..Default::default()
     };
-    eframe::run_native("ORBIT", options, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| e.to_string())
+    eframe::run_native("ORBIT", options, Box::new(move |cc| Ok(Box::new(App::new(cc, launched_at_login))))).map_err(|e| e.to_string())
 }
 
 /// Result of a viewer process: Ok on a normal close, Err(message) if it failed.
@@ -43,12 +43,30 @@ struct App {
     ip_checked: Instant,
     copied_at: Option<Instant>,
     updater: crate::update::Updater,
+    /// Started by Windows at login: minimize on the first frame.
+    launched_at_login: bool,
+    first_frame: bool,
+    /// Next automatic share attempt (auto-share is on and sharing isn't running).
+    auto_share_at: Option<Instant>,
+    /// The user pressed STOP: don't auto-share again until ORBIT restarts.
+    user_stopped: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext) -> App {
+    fn new(cc: &eframe::CreationContext, launched_at_login: bool) -> App {
         theme(&cc.egui_ctx);
-        let cfg = Config::load();
+        let mut cfg = Config::load();
+        if cfg.autostart {
+            if crate::autostart::is_enabled() || launched_at_login {
+                // Keep the startup entry pointing at this exe (it may have moved or updated).
+                let _ = crate::autostart::set(true);
+                cfg.share_tab = true;
+            } else {
+                // The user removed it (e.g. in Task Manager > Startup): respect that.
+                cfg.autostart = false;
+            }
+        }
+        let auto_share = cfg.autostart;
         App {
             addr: cfg.recent.first().cloned().unwrap_or_default(),
             cfg,
@@ -62,6 +80,10 @@ impl App {
             ip_checked: Instant::now(),
             copied_at: None,
             updater: crate::update::Updater::new(),
+            launched_at_login,
+            first_frame: true,
+            auto_share_at: if auto_share { Some(Instant::now()) } else { None },
+            user_stopped: false,
         }
     }
 
@@ -124,8 +146,11 @@ impl App {
     fn toggle_share(&mut self) {
         if let Some(s) = self.server.take() {
             s.stop();
+            self.user_stopped = true;
+            self.auto_share_at = None;
             return;
         }
+        self.user_stopped = false;
         self.share_error = None;
         let start = || -> anyhow::Result<server::ServerHandle> {
             let mon = server::preflight(self.monitor)?;
@@ -143,6 +168,20 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.first_frame {
+            self.first_frame = false;
+            if self.launched_at_login {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            }
+        }
+        // Auto-share: keep trying (Tailscale and the network can take a while after boot).
+        if self.cfg.autostart && self.server.is_none() && !self.user_stopped && self.auto_share_at.is_some_and(|t| Instant::now() >= t) {
+            self.toggle_share();
+            self.auto_share_at = if self.server.is_some() { None } else { Some(Instant::now() + Duration::from_secs(5)) };
+        }
+        if self.auto_share_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         self.poll_viewer(ctx);
         self.updater.tick(ctx);
         match self.updater.launch_if_ready() {
@@ -289,6 +328,17 @@ impl App {
             widgets::segmented(ui, &mons, &mut self.monitor, !sharing);
         }
 
+        let mut auto = self.cfg.autostart;
+        if widgets::check(ui, &mut auto, "START SHARING WHEN WINDOWS STARTS") {
+            match crate::autostart::set(auto) {
+                Ok(()) => {
+                    self.cfg.autostart = auto;
+                    self.cfg.save();
+                }
+                Err(e) => self.share_error = Some(format!("{e:#}")),
+            }
+        }
+
         if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
             self.toggle_share();
         }
@@ -308,6 +358,9 @@ impl App {
             }
             None => {
                 if let Some(e) = &self.share_error {
+                    if self.auto_share_at.is_some() {
+                        widgets::status_line(ui, "AUTO-SHARE: RETRYING EVERY 5 S...", true);
+                    }
                     widgets::notice(ui, &e.to_uppercase());
                 } else {
                     ui.label(RichText::new("ONLY DEVICES ON YOUR TAILNET CAN REACH THIS PC").font(FontId::monospace(10.5)).color(gray(100)));

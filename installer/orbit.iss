@@ -44,6 +44,10 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
+[Registry]
+; "Start sharing when Windows starts" lives here (written by ORBIT itself); remove it on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "ORBIT"; Flags: uninsdeletevalue
+
 [Run]
 ; Allow incoming connections to ORBIT (UDP, QUIC). ORBIT itself only listens on the Tailscale
 ; address, so this doesn't expose it on the local network.

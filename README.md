@@ -25,6 +25,24 @@ Both PCs need Tailscale running and signed in to the same tailnet.
 - In the viewer: `Ctrl+Alt+Enter` toggles fullscreen. The title bar shows fps and latency.
 - Settings and recent addresses live in `%APPDATA%\ORBIT\orbit.cfg`.
 
+## Unattended: share automatically after every restart
+
+On the sharing PC, in ORBIT's SHARE tab, tick **START SHARING WHEN WINDOWS STARTS**. From then on
+ORBIT opens minimized at every Windows sign-in and starts sharing by itself (retrying every 5 s
+until Tailscale and the network are up). It also resumes sharing after an update.
+
+ORBIT needs a signed-in, unlocked desktop (Windows doesn't let normal apps capture the sign-in
+screen). For restarts with nobody at the PC, also set up:
+
+1. **Windows signs in automatically.** Easiest and safest: Microsoft's free
+   [Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon) tool (stores the
+   password encrypted). Run it, enter the account and password, click Enable.
+   (Only do this on a PC in a place you trust: anyone at the keyboard gets in.)
+2. **Tailscale connects before sign-in:** Tailscale tray icon → Preferences → **Run unattended**.
+3. **Don't let it lock or sleep:** Settings → Accounts → Sign-in options → "If you've been away,
+   when should Windows require you to sign in again?" → **Never**; Settings → System → Power →
+   Screen and sleep → sleep **Never** (turning the screen off is fine).
+
 ## Updates
 
 Every ORBIT checks GitHub Releases at startup and every 30 minutes. When a newer version is out,
@@ -44,7 +62,8 @@ publishes the release. Plain pushes to `main` don't trigger updates, only versio
 
 1. Install Rust: https://rustup.rs (MSVC toolchain), plus **Visual Studio Build Tools** with the
    "Desktop development with C++" workload (Rust needs its linker).
-2. `cargo build --release` → `targetelease\orbit.exe` (also `orbit-server.exe` /
+2. `cargo build --release` → `target
+elease\orbit.exe` (also `orbit-server.exe` /
    `orbit-client.exe`, command-line versions that print stats every second).
 
 LLVM is only needed to regenerate `server/src/nvenc/sys.rs`; it's committed.

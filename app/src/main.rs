@@ -7,6 +7,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod config;
 mod icon;
 mod ui;
@@ -36,7 +37,11 @@ fn main() {
         return;
     }
     server::dpi_aware();
-    if let Err(e) = ui::run() {
+    let Some(_instance) = autostart::single_instance() else {
+        return; // already running: brought the existing window forward
+    };
+    let launched_at_login = args.iter().any(|a| a == "--autostart");
+    if let Err(e) = ui::run(launched_at_login) {
         eprintln!("{e}");
         std::process::exit(1);
     }
