@@ -51,8 +51,8 @@ pub struct Session {
     pub stats: Arc<NetStats>,
     /// Set by the window thread when decoding failed: the gate then waits for a keyframe.
     pub decoder_failed: Arc<AtomicBool>,
-    /// Pointer shape messages ([`Ctrl::Cursor`], [`Ctrl::CursorImage`]) for the window thread.
-    pub cursor: mpsc::Receiver<Ctrl>,
+    /// Messages for the window thread: pointer shapes, the screen list, video size changes.
+    pub events: mpsc::Receiver<Ctrl>,
     /// Clipboard sync and file transfer for this session (None if it couldn't start).
     pub sync: Option<xfer::Sync>,
     pub width: u32,
@@ -286,7 +286,7 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
             while let Ok(m) = read_ctrl(&mut recv).await {
                 match m {
                     Ctrl::Pong { client_us, server_us } => clock.lock().unwrap().add(client_us, server_us, now_us()),
-                    m @ (Ctrl::Cursor { .. } | Ctrl::CursorImage { .. }) => {
+                    m @ (Ctrl::Cursor { .. } | Ctrl::CursorImage { .. } | Ctrl::Monitors { .. } | Ctrl::VideoFormat { .. }) => {
                         if cursor_tx.send(m).is_err() {
                             break;
                         }
@@ -353,5 +353,5 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
     }
 
     let sync = xfer::start(conn.clone(), opts.clipboard).map_err(|e| eprintln!("clipboard sync unavailable: {e:#}")).ok();
-    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, sync, width, height, fps })
+    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, events: cursor_rx, sync, width, height, fps })
 }

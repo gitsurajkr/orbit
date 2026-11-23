@@ -27,7 +27,7 @@
 - [x] Pairing / auth (milestone 5): ID certificates, paired-device list, own-account auto-pair, 6-digit code (SPAKE2), known-PC check.
 - [x] Clipboard sync: text and images both ways (xfer crate, one QUIC stream per item).
 - [x] Send files: drag onto the viewer, or copy/paste in Explorer; paced to leave the video room.
-- [ ] Multi-monitor switching from the viewer.
+- [x] Multi-monitor switching from the viewer (Ctrl+Alt+1..9, window menu).
 - [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).
 - [x] Show the remote cursor shape (standard shapes by id, app pointers as images; protocol v3).
 - [x] FEC: Reed-Solomon parity per frame, 10–40 % following loss (protocol v2).

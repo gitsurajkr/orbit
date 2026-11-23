@@ -112,6 +112,8 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
     };
 
     let mut cursors = cursor::Cursors::new();
+    // The video's size: changes when the sharing PC switches screens.
+    let (mut video_w, mut video_h) = (session.width, session.height);
     let mut decoded = Vec::new();
     let mut shown: Option<decode::Decoded> = None;
     let mut ticker = Ticker::new(Duration::from_secs(1));
@@ -135,10 +137,23 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
             println!("disconnected: {reason}");
             break;
         }
-        while let Ok(m) = session.cursor.try_recv() {
-            if let (false, Some(c)) = (view_only, cursors.handle(m)) {
-                CURSOR.with(|cur| cur.set(Some(c)));
-                cursor::apply_now(hwnd, c);
+        while let Ok(m) = session.events.try_recv() {
+            match m {
+                Ctrl::Monitors { current, list } => monitor_menu(hwnd, current, &list),
+                Ctrl::VideoFormat { width, height } => {
+                    (video_w, video_h) = (width as u32, height as u32);
+                    SINK.with(|s| {
+                        if let Some(s) = s.borrow_mut().as_mut() {
+                            (s.video_w, s.video_h) = (video_w, video_h);
+                        }
+                    });
+                }
+                m => {
+                    if let (false, Some(c)) = (view_only, cursors.handle(m)) {
+                        CURSOR.with(|cur| cur.set(Some(c)));
+                        cursor::apply_now(hwnd, c);
+                    }
+                }
             }
         }
         if let Some((w, h)) = SINK.with(|s| s.borrow_mut().as_mut().and_then(|s| s.resized.take())) {
@@ -167,7 +182,7 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
             }
         }
         if let (Some((capture_us, _)), Some(d)) = (newest, shown.as_ref()) {
-            renderer.present(d, session.width, session.height)?;
+            renderer.present(d, video_w, video_h)?;
             presented += 1;
             if let Some(cap) = session.clock.lock().unwrap().to_client(capture_us) {
                 latency.add((now_us() as i64 - cap) as f64 / 1e3);
@@ -214,6 +229,30 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
     }
     session.conn.close(0u32.into(), b"bye");
     Ok(())
+}
+
+/// First window-menu id for "Screen N" (ids step by 16: Windows uses the low 4 bits).
+const MENU_SCREEN: usize = 0x1000;
+
+/// Lists the sharing PC's screens in the window menu (Alt+Space / right-click the title bar),
+/// with a check on the one shown.
+fn monitor_menu(hwnd: HWND, current: u8, list: &[proto::ctrl::MonitorDesc]) {
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        for i in 0..10 {
+            let _ = DeleteMenu(menu, (MENU_SCREEN + i * 16) as u32, MF_BYCOMMAND);
+        }
+        let _ = DeleteMenu(menu, (MENU_SCREEN + 9 * 16) as u32, MF_BYCOMMAND);
+        if list.len() < 2 {
+            return;
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, MENU_SCREEN + 9 * 16, None);
+        for (i, m) in list.iter().enumerate().take(9) {
+            let flags = if i == current as usize { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let text = format!("Screen {} — {}×{}{}\tCtrl+Alt+{}", i + 1, m.width, m.height, if m.primary { " (main)" } else { "" }, i + 1);
+            let _ = AppendMenuW(menu, flags, MENU_SCREEN + i * 16, &HSTRING::from(text));
+        }
+    }
 }
 
 /// The files in a WM_DROPFILES message (and releases it).
@@ -401,6 +440,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let ctrl_alt = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 && GetKeyState(VK_MENU.0 as i32) < 0 };
                 if down && vk == VK_RETURN.0 && ctrl_alt {
                     toggle_fullscreen(hwnd, s); // local shortcut, not forwarded
+                } else if ctrl_alt && (b'1' as u16..=b'9' as u16).contains(&vk) {
+                    if down {
+                        let _ = s.ctrl.send(Ctrl::SelectMonitor { index: (vk - b'1' as u16) as u8 }); // local shortcut
+                    }
                 } else {
                     let scan = ((lp.0 >> 16) & 0xFF) as u16;
                     let extended = (lp.0 >> 24) & 1 != 0;
@@ -450,6 +493,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 None => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            // "Screen N" entries we added to the window menu.
+            WM_SYSCOMMAND if (MENU_SCREEN..MENU_SCREEN + 16 * 9).contains(&(wp.0 & 0xFFF0)) => {
+                let index = ((wp.0 & 0xFFF0) - MENU_SCREEN) / 16;
+                SINK.with(|s| {
+                    if let Ok(s) = s.try_borrow() {
+                        if let Some(s) = s.as_ref() {
+                            let _ = s.ctrl.send(Ctrl::SelectMonitor { index: index as u8 });
+                        }
+                    }
+                });
+                LRESULT(0)
+            }
             // Keep Alt / F10 from opening the (nonexistent) window menu.
             WM_SYSCOMMAND if (wp.0 & 0xFFF0) == SC_KEYMENU as usize => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wp, lp),

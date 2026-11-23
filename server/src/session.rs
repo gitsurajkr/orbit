@@ -42,6 +42,11 @@ pub struct Settings {
 
 struct Shared {
     force_idr: AtomicBool,
+    /// The screen being shown; the video thread rebuilds its pipeline when `switch` is set.
+    monitor: Mutex<MonitorInfo>,
+    switch: AtomicBool,
+    /// The control stream's outbox (to send VideoFormat).
+    out: tokio::sync::mpsc::UnboundedSender<Ctrl>,
     /// Direct or relayed, from the local Tailscale.
     path: proto::tailscale::PathWatcher,
     stop: Arc<AtomicBool>,
@@ -328,14 +333,21 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         .ok();
     write_ctrl(&mut send, &Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
-    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
+    // Everything sent on the control stream goes through this channel to one writer.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Ctrl>();
+    let mut monitors = crate::capture::list_monitors().unwrap_or_default();
+    let mut current = monitors.iter().position(|m| m.device_name == s.monitor.device_name).unwrap_or(0);
+    let describe = |ms: &[MonitorInfo], cur: usize| Ctrl::Monitors {
+        current: cur as u8,
+        list: ms.iter().map(|m| proto::ctrl::MonitorDesc { width: m.width as u16, height: m.height as u16, primary: m.left == 0 && m.top == 0 }).collect(),
+    };
+    out_tx.send(describe(&monitors, current))?;
+    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), monitor: Mutex::new(s.monitor.clone()), switch: AtomicBool::new(false), out: out_tx.clone(), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
     let video = {
         let (conn, s, shared) = (conn.clone(), s.clone(), shared.clone());
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
     };
     let input = Input::new(s.monitor.clone());
-    // Everything sent on the control stream goes through this channel to one writer.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Ctrl>();
 
     let writer = async {
         while let Some(m) = out_rx.recv().await {
@@ -377,6 +389,20 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
             match read_ctrl(&mut recv).await? {
                 Ctrl::KeyframeRequest => shared.force_idr.store(true, Ordering::Release),
                 Ctrl::Ping { client_us } => out_tx.send(Ctrl::Pong { client_us, server_us: now_us() })?,
+                Ctrl::SelectMonitor { index } => {
+                    // Screens may have been plugged in or out since the list was sent.
+                    monitors = crate::capture::list_monitors().unwrap_or(monitors);
+                    if let Some(m) = monitors.get(index as usize).cloned() {
+                        if index as usize != current {
+                            println!("showing screen {} ({}x{})", index + 1, m.width, m.height);
+                            current = index as usize;
+                            input.set_monitor(m.clone());
+                            *shared.monitor.lock().unwrap() = m;
+                            shared.switch.store(true, Ordering::Release);
+                        }
+                    }
+                    out_tx.send(describe(&monitors, current))?;
+                }
                 c @ (Ctrl::Key { .. } | Ctrl::MouseButton { .. } | Ctrl::Wheel { .. }) => input.handle(c),
                 other => bail!("unexpected {other:?}"),
             }
@@ -432,9 +458,13 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     'pipeline: while !shared.stop.load(Ordering::Acquire) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
-        let mut p = match Pipeline::new(s.monitor.clone(), s.fps, rate.video_bps()) {
+        shared.switch.store(false, Ordering::Release);
+        let mon = shared.monitor.lock().unwrap().clone();
+        let mut p = match Pipeline::new(mon.clone(), s.fps, rate.video_bps()) {
             Ok(p) => {
                 shared.status.update(|i| i.error = None);
+                // Tell the viewer the size before the first frame (the new keyframe).
+                let _ = shared.out.send(Ctrl::VideoFormat { width: mon.width as u16, height: mon.height as u16 });
                 p
             }
             Err(e) => {
@@ -446,6 +476,9 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         };
         let mut need_idr = true;
         while !shared.stop.load(Ordering::Acquire) {
+            if shared.switch.load(Ordering::Acquire) {
+                continue 'pipeline; // another screen: rebuild capture + encoder for it
+            }
             let started = Instant::now();
             // Stats first, so a still screen (no frames to send) still reports 0 fps.
             if let Some(secs) = ticker.tick(started) {

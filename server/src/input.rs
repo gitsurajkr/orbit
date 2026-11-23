@@ -13,7 +13,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
 
 pub struct Input {
-    mon: MonitorInfo,
+    /// The screen being shown (mouse positions are relative to it); changes on a switch.
+    mon: Mutex<MonitorInfo>,
     state: Mutex<State>,
 }
 
@@ -70,7 +71,11 @@ fn button(b: u8, down: bool) -> Option<INPUT> {
 
 impl Input {
     pub fn new(mon: MonitorInfo) -> Input {
-        Input { mon, state: Mutex::new(State::default()) }
+        Input { mon: Mutex::new(mon), state: Mutex::new(State::default()) }
+    }
+
+    pub fn set_monitor(&self, mon: MonitorInfo) {
+        *self.mon.lock().unwrap() = mon;
     }
 
     /// Absolute move. Ignores moves older than the newest applied (datagrams can reorder).
@@ -93,8 +98,9 @@ impl Input {
                 GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
             )
         };
-        let px = self.mon.left as i64 + (m.x as i64 * (self.mon.width as i64 - 1)) / 65535;
-        let py = self.mon.top as i64 + (m.y as i64 * (self.mon.height as i64 - 1)) / 65535;
+        let mon = self.mon.lock().unwrap().clone();
+        let px = mon.left as i64 + (m.x as i64 * (mon.width as i64 - 1)) / 65535;
+        let py = mon.top as i64 + (m.y as i64 * (mon.height as i64 - 1)) / 65535;
         let nx = ((px - vx as i64) * 65535 / (vw as i64 - 1)) as i32;
         let ny = ((py - vy as i64) * 65535 / (vh as i64 - 1)) as i32;
         send(&[mouse(nx, ny, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)]);

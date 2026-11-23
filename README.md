@@ -76,6 +76,7 @@ The remote screen opens in its own window. To end the session, close that window
 |---|---|
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Enter</kbd> | Toggle fullscreen (stays on this PC) |
 | <kbd>Win</kbd>, <kbd>Alt</kbd>+<kbd>Tab</kbd>, <kbd>Ctrl</kbd>+<kbd>Esc</kbd> | Go to the remote PC while the viewer has focus |
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd>…<kbd>9</kbd> | Show the remote PC's screen 1…9 (also in the window menu: <kbd>Alt</kbd>+<kbd>Space</kbd>) |
 | Title bar | Live fps, bitrate and latency |
 | **VIEW ONLY** (CONNECT tab) | Watch without controlling |
 | **SYNC CLIPBOARD** (CONNECT tab) | Copy text or an image on one PC, paste it on the other (on by default) |
@@ -160,7 +161,7 @@ How a device gets on the list, once:
 
 ## Known limits
 
-- One monitor at a time.
+- One remote screen at a time (switch with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd>).
 - Your own pointer stands in for the remote one (which is why it feels instant); it takes the remote pointer's shape: I-beam, resize arrows, hand, hidden during video.
 - <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
 - The sharing PC must stay **unlocked**: the lock screen and UAC prompts can't be captured by a normal app. ORBIT waits and resumes on unlock.
@@ -171,7 +172,6 @@ How a device gets on the list, once:
 
 - [ ] NVENC reference-frame invalidation: recover from heavy loss without a keyframe
 - [ ] Lower resolution automatically on very slow links
-- [ ] Multi-monitor switching
 - [ ] Lock screen and UAC capture (Windows service)
 
 ## Build from source

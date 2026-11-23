@@ -42,10 +42,24 @@ pub enum Ctrl {
     /// (index into [`cursor::STANDARD`] + 1) or [`cursor::CUSTOM`] with `key` naming an image
     /// sent earlier in a [`Ctrl::CursorImage`].
     Cursor { kind: u8, key: u32 },
+    /// S→C: the sharing PC's screens and which one is shown (after the hello, and on change).
+    Monitors { current: u8, list: Vec<MonitorDesc> },
+    /// C→S: show screen `index` of [`Ctrl::Monitors`].
+    SelectMonitor { index: u8 },
+    /// S→C: the video's size changed (another screen is shown).
+    VideoFormat { width: u16, height: u16 },
     /// S→C: an app-defined pointer image, sent once per distinct image before the first
     /// [`Ctrl::Cursor`] that uses it. `key` is a hash of the pixels; `bgra` is top-down,
     /// straight (not premultiplied) alpha, `width * height * 4` bytes.
     CursorImage { key: u32, hot_x: u16, hot_y: u16, width: u16, height: u16, bgra: Vec<u8> },
+}
+
+/// One screen in [`Ctrl::Monitors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorDesc {
+    pub width: u16,
+    pub height: u16,
+    pub primary: bool,
 }
 
 /// [`Ctrl::ClientHello`] flags.
@@ -108,6 +122,9 @@ mod tag {
     pub const PAIR_REPLY: u8 = 13;
     pub const PAIR_PROOF: u8 = 14;
     pub const DENIED: u8 = 15;
+    pub const MONITORS: u8 = 16;
+    pub const SELECT_MONITOR: u8 = 17;
+    pub const VIDEO_FORMAT: u8 = 18;
 }
 
 /// Longest name / reason text carried (bytes, cut at a character boundary).
@@ -145,6 +162,25 @@ impl Ctrl {
                 out.push(flags);
                 put_text(out, name);
                 tag::CLIENT_HELLO
+            }
+            Ctrl::Monitors { current, ref list } => {
+                out.push(current);
+                out.push(list.len().min(255) as u8);
+                for m in list.iter().take(255) {
+                    out.extend_from_slice(&m.width.to_le_bytes());
+                    out.extend_from_slice(&m.height.to_le_bytes());
+                    out.push(m.primary as u8);
+                }
+                tag::MONITORS
+            }
+            Ctrl::SelectMonitor { index } => {
+                out.push(index);
+                tag::SELECT_MONITOR
+            }
+            Ctrl::VideoFormat { width, height } => {
+                out.extend_from_slice(&width.to_le_bytes());
+                out.extend_from_slice(&height.to_le_bytes());
+                tag::VIDEO_FORMAT
             }
             Ctrl::PairRequired { code_active } => {
                 out.push(code_active as u8);
@@ -224,6 +260,21 @@ impl Ctrl {
                 let flags = b.get(2).copied().unwrap_or(0);
                 let name = b.get(3..).map(|n| String::from_utf8_lossy(&n[..n.len().min(MAX_TEXT)]).into_owned()).unwrap_or_default();
                 Ctrl::ClientHello { version: u16_at(0), flags, name }
+            }
+            tag::MONITORS => {
+                need(2)?;
+                let n = b[1] as usize;
+                need(2 + n * 5)?;
+                let list = (0..n).map(|i| MonitorDesc { width: u16_at(2 + i * 5), height: u16_at(4 + i * 5), primary: b[6 + i * 5] != 0 }).collect();
+                Ctrl::Monitors { current: b[0], list }
+            }
+            tag::SELECT_MONITOR => {
+                need(1)?;
+                Ctrl::SelectMonitor { index: b[0] }
+            }
+            tag::VIDEO_FORMAT => {
+                need(4)?;
+                Ctrl::VideoFormat { width: u16_at(0), height: u16_at(2) }
             }
             tag::PAIR_REQUIRED => {
                 need(1)?;
@@ -318,6 +369,10 @@ mod tests {
             Ctrl::ClientHello { version: 1, flags: hello::CLIPBOARD, name: "LAPTOP-NOVA".into() },
             Ctrl::ClientHello { version: 1, flags: 0, name: String::new() },
             Ctrl::PairRequired { code_active: true },
+            Ctrl::Monitors { current: 1, list: vec![MonitorDesc { width: 2560, height: 1440, primary: true }, MonitorDesc { width: 1920, height: 1080, primary: false }] },
+            Ctrl::Monitors { current: 0, list: vec![] },
+            Ctrl::SelectMonitor { index: 2 },
+            Ctrl::VideoFormat { width: 1920, height: 1080 },
             Ctrl::PairStart { msg: vec![1, 2, 3] },
             Ctrl::PairReply { msg: vec![4; 33] },
             Ctrl::PairProof { proof: vec![5; 32] },
