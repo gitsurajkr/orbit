@@ -811,15 +811,14 @@ impl App {
         if always && self.cfg.autostart {
             self.set_login_autostart(false); // the service does it now
         }
-        ui.label(
-            RichText::new(match (always, self.cfg.autostart) {
-                (true, _) => "      RUNNING · LOCK SCREEN + UAC INCLUDED",
-                (false, true) => "      AFTER YOU SIGN IN (NOT ON THE LOCK SCREEN)",
-                _ => "      ALSO WORKS ON THE LOCK SCREEN",
-            })
-            .font(FontId::monospace(9.5))
-            .color(gray(120)),
-        );
+        let hint = match (always, self.cfg.autostart) {
+            (true, _) => Some("      RUNNING · LOCK SCREEN + UAC INCLUDED"),
+            (false, true) => Some("      AFTER YOU SIGN IN (NOT ON THE LOCK SCREEN)"),
+            _ => None,
+        };
+        if let Some(h) = hint {
+            ui.label(RichText::new(h).font(FontId::monospace(9.5)).color(gray(120)));
+        }
 
         let (n, pin_showing) = match self.always.devices().filter(|_| always) {
             Some(a) => (a.devices.len(), a.pin.is_some()),
