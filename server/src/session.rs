@@ -36,6 +36,8 @@ pub struct Settings {
 
 struct Shared {
     force_idr: AtomicBool,
+    /// Direct or relayed, from the local Tailscale.
+    path: proto::tailscale::PathWatcher,
     stop: Arc<AtomicBool>,
     status: Arc<Status>,
 }
@@ -235,7 +237,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
     }
     write_ctrl(&mut send, Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
-    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), stop: stop.clone(), status });
+    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
     let video = {
         let (conn, s, shared) = (conn.clone(), s.clone(), shared.clone());
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
@@ -329,10 +331,11 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 }
                 let (target, fec) = (new_bps as f64 / 1e6, rate.fec_percent());
                 println!(
-                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | fec {fec}% | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms | lost pkts {lost}",
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | fec {fec}% | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms{} | lost pkts {lost}",
                     p.capture_mode(),
                     rate.reason(),
                     if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
+                    shared.path.suffix(" "),
                 );
                 let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
                 let mode = match p.capture_mode() {
@@ -340,7 +343,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     _ => "",
                 };
                 shared.status.update(|i| {
-                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} ({}) · FEC {fec}% · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}", rate.reason().to_uppercase()))
+                    i.stats = Some(format!("{mode}{fps:.0} FPS · {mbit:.1} MBIT/S · RATE {target:.1} ({}) · FEC {fec}% · ENCODE {enc_avg} MS · RTT {rtt:.0} MS · NET WAIT {wait_ms:.0} MS · DROPPED {dropped}{}", rate.reason().to_uppercase(), shared.path.suffix(" · ")))
                 });
                 lost_prev = st.path.lost_packets;
                 sent_prev = st.path.sent_packets;

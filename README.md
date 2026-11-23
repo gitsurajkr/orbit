@@ -128,8 +128,9 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 | `RTT` | Round-trip time to the viewer |
 | `NET WAIT` | Time spent waiting for the network to drain. High values mean the link is the limit |
 | `DROPPED` | Encoded frames thrown away (should stay at 0) |
+| `DIRECT` · `RELAY BOM` · `PEER RELAY` | How Tailscale carries the traffic right now. A relay adds latency; Tailscale often switches to direct after a few seconds |
 
-**Viewer title bar:** `fps (recv) | Mbit/s | latency ms avg/p95/max`. The full line, printed when the viewer runs from a terminal, adds `decode ms`, `frame spread ms`, `rtt` and `lost · skip · keyreq · fec-fixed`. `fec-fixed` counts frames that FEC saved from being lost.
+**Viewer title bar:** `fps (recv) | Mbit/s | latency ms avg/p95/max | DIRECT` (or `RELAY BOM`). The full line, printed when the viewer runs from a terminal, adds `decode ms`, `frame spread ms`, `rtt` and `lost · skip · keyreq · fec-fixed`. `fec-fixed` counts frames that FEC saved from being lost.
 
 ## Security
 
@@ -154,7 +155,6 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 
 - [ ] NVENC reference-frame invalidation: recover from heavy loss without a keyframe
 - [ ] Lower resolution automatically on very slow links
-- [ ] "Relayed via Tailscale" indicator with the extra latency
 - [ ] Pairing with a PIN and certificate pinning
 - [ ] Clipboard sync and multi-monitor switching
 - [ ] Remote cursor shape, and forwarding <kbd>Win</kbd> / <kbd>Alt</kbd>+<kbd>Tab</kbd>

@@ -19,8 +19,8 @@
 - [ ] First real in-app update: on a PC with v0.1.3, click UPDATE → installs v0.1.4 and reopens.
 
 ## Later
-- [ ] Show "TAILSCALE RELAY (city) · +xx ms" in ORBIT when the link to the other PC isn't
-      direct (from `tailscale status --json`), so high latency explains itself.
+- [x] Show DIRECT / RELAY (city) / PEER RELAY next to the stats on both sides
+      (from `tailscale status --json`, every 5 s), so high latency explains itself.
 - [x] Adaptive bitrate (milestone 4): server/src/rate.rs, from RTT, loss and net wait.
 - [ ] Tune adaptive bitrate on the real relayed link (recovery after a deep cut is slow).
 - [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).

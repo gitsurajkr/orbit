@@ -11,6 +11,7 @@
 pub mod clock;
 pub mod ctrl;
 pub mod stats;
+pub mod tailscale;
 pub mod video;
 
 /// Bumped whenever any byte layout in this crate changes.
