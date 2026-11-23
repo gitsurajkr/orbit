@@ -210,6 +210,8 @@ impl Duplicator {
         // On the secure desktop (UAC, Ctrl+Alt+Del) duplication is refused for a while; keep
         // trying instead of giving up.
         for attempt in 0.. {
+            // As SYSTEM, move to the desktop now showing (lock screen, UAC) so it can be captured.
+            crate::desktop::follow_input_desktop();
             let mut r = unsafe { self.output.DuplicateOutput(&gpu.device) };
             // Some systems refuse the old call but accept the newer DuplicateOutput1 (Win10 1703+).
             if matches!(&r, Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED) {

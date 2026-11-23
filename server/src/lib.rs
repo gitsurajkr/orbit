@@ -3,6 +3,7 @@
 
 pub mod capture;
 pub mod cursor;
+pub mod desktop;
 pub mod input;
 pub mod net;
 pub mod nvenc;

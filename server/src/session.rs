@@ -461,11 +461,13 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let (mut enc_ms, mut bridge_ms) = (Dist::default(), Dist::default());
     let mut lost_prev = conn.stats().path.lost_packets;
     let mut sent_prev = conn.stats().path.sent_packets;
+    let mut desktop_check = Instant::now();
 
     'pipeline: while !shared.stop.load(Ordering::Acquire) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
         shared.switch.store(false, Ordering::Release);
+        crate::desktop::follow_input_desktop();
         let mon = shared.monitor.lock().unwrap().clone();
         let mut p = match Pipeline::new(mon.clone(), s.fps, rate.video_bps()) {
             Ok(p) => {
@@ -489,6 +491,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         while !shared.stop.load(Ordering::Acquire) {
             if shared.switch.load(Ordering::Acquire) {
                 continue 'pipeline; // another screen: rebuild capture + encoder for it
+            }
+            // GDI capture gets no "desktop changed" error like Desktop Duplication does, so look
+            // for a switch (lock screen, UAC; only visible as SYSTEM) every 250 ms.
+            if p.capture_mode() == "gdi" && desktop_check.elapsed() >= Duration::from_millis(250) {
+                desktop_check = Instant::now();
+                if crate::desktop::follow_input_desktop() {
+                    continue 'pipeline;
+                }
             }
             let started = Instant::now();
             // Stats first, so a still screen (no frames to send) still reports 0 fps.

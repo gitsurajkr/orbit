@@ -3,7 +3,11 @@
 //! Keys arrive as hardware scan codes, so the server's keyboard layout decides what character a
 //! key makes, just like a physical keyboard plugged into the server.
 //! Note: Windows blocks injected input into elevated (admin) windows unless ORBIT itself
-//! runs as administrator.
+//! runs as administrator (or as the ORBIT Agent, as SYSTEM).
+//!
+//! All injection happens on one dedicated thread ([`Input`] just queues to it): `SendInput`
+//! only reaches the desktop the calling thread is attached to, and that thread follows the
+//! input desktop (lock screen, UAC) when ORBIT runs as SYSTEM (see desktop.rs).
 
 use crate::capture::MonitorInfo;
 use proto::ctrl::{Ctrl, MouseMove};
@@ -12,7 +16,7 @@ use std::sync::Mutex;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN};
 
-pub struct Input {
+struct Injector {
     /// The screen being shown (mouse positions are relative to it); changes on a switch.
     mon: Mutex<MonitorInfo>,
     state: Mutex<State>,
@@ -69,9 +73,9 @@ fn button(b: u8, down: bool) -> Option<INPUT> {
     Some(mouse(0, 0, data, flags))
 }
 
-impl Input {
-    pub fn new(mon: MonitorInfo) -> Input {
-        Input { mon: Mutex::new(mon), state: Mutex::new(State::default()) }
+impl Injector {
+    fn new(mon: MonitorInfo) -> Injector {
+        Injector { mon: Mutex::new(mon), state: Mutex::new(State::default()) }
     }
 
     pub fn set_monitor(&self, mon: MonitorInfo) {
@@ -141,5 +145,58 @@ impl Input {
         if !ups.is_empty() {
             send(&ups);
         }
+    }
+}
+
+enum Cmd {
+    Move(MouseMove),
+    Ctrl(Ctrl),
+    SetMonitor(MonitorInfo),
+    ReleaseAll,
+}
+
+/// Queues input for the injection thread; the thread ends when this is dropped.
+pub struct Input {
+    tx: std::sync::mpsc::Sender<Cmd>,
+}
+
+impl Input {
+    pub fn new(mon: MonitorInfo) -> Input {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let _ = std::thread::Builder::new().name("input".into()).spawn(move || {
+            let inj = Injector::new(mon);
+            let mut checked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            while let Ok(cmd) = rx.recv() {
+                // Stay on the desktop that receives input (cheap; at most every 50 ms).
+                if checked.elapsed() >= std::time::Duration::from_millis(50) {
+                    crate::desktop::follow_input_desktop();
+                    checked = std::time::Instant::now();
+                }
+                match cmd {
+                    Cmd::Move(m) => inj.mouse_move(m),
+                    Cmd::Ctrl(c) => inj.handle(c),
+                    Cmd::SetMonitor(m) => inj.set_monitor(m),
+                    Cmd::ReleaseAll => inj.release_all(),
+                }
+            }
+        });
+        Input { tx }
+    }
+
+    pub fn set_monitor(&self, mon: MonitorInfo) {
+        let _ = self.tx.send(Cmd::SetMonitor(mon));
+    }
+
+    /// Absolute move. Moves older than the newest applied are ignored (datagrams can reorder).
+    pub fn mouse_move(&self, m: MouseMove) {
+        let _ = self.tx.send(Cmd::Move(m));
+    }
+
+    pub fn handle(&self, c: Ctrl) {
+        let _ = self.tx.send(Cmd::Ctrl(c));
+    }
+
+    pub fn release_all(&self) {
+        let _ = self.tx.send(Cmd::ReleaseAll);
     }
 }
