@@ -31,7 +31,7 @@ packet-loss recovery, in a single portable `.exe`.
 | **Adapts to the link** | Bitrate follows round-trip time, packet loss and send-queue pressure every second. The encoder is retuned live, without a keyframe. |
 | **Survives packet loss** | Every frame carries Reed-Solomon parity (10–40 %, following measured loss). Lost packets are rebuilt on arrival: no freeze, no resend. A frame lost anyway is repaired with reference-frame invalidation: the next frame is predicted from an older one the viewer has, so there's no blurry keyframe. |
 | **QUIC + BBR transport** | Video travels as unreliable QUIC datagrams, paced by BBR congestion control, over Tailscale's encrypted WireGuard tunnel. |
-| **Runs quietly** | Lives in the notification area, can start sharing when Windows starts, and updates itself from GitHub Releases. |
+| **Runs quietly** | Lives in the notification area, can share automatically from Windows' start, lock screen included, and updates itself from GitHub Releases. |
 
 ## How it works
 
@@ -99,15 +99,18 @@ ORBIT sits in the **notification area** next to the clock:
 - **Hover** to see what it's doing, e.g. `ORBIT · SHARING · 100.x.y.z CONNECTED`.
 - The window's **─** and **✕** buttons send ORBIT to the tray, so sharing keeps running. Quit from the tray menu.
 
-### Share automatically after every restart
+### Share automatically, even on the lock screen
 
-On the sharing PC, tick **START SHARING WHEN WINDOWS STARTS** in the SHARE tab. ORBIT then starts in the tray at every sign-in and begins sharing once Tailscale and the network are up. If the network drops the listener, ORBIT restarts it by itself.
+On the sharing PC, tick **SHARE AUTOMATICALLY · EVEN ON THE LOCK SCREEN** in the SHARE tab and allow Windows' admin prompt once. ORBIT then shares through a small Windows service (*ORBIT Remote Desktop*) that:
 
-Windows only lets apps capture a signed-in, unlocked desktop. For restarts with nobody at the PC, also set up:
+- starts with Windows, **before anyone signs in**, so you can sign in remotely after a restart;
+- shows and controls the **lock screen, sign-in screen and UAC prompts**;
+- can press **Ctrl+Alt+Del** (viewer window menu: <kbd>Alt</kbd>+<kbd>Space</kbd> → *Send Ctrl+Alt+Del*);
+- keeps your paired devices and this PC's ID (they're copied to it, and back when you turn it off).
 
-1. **Automatic sign-in:** Microsoft's free [Autologon](https://learn.microsoft.com/sysinternals/downloads/autologon) tool (stores the password encrypted). Only do this on a PC in a place you trust.
-2. **Tailscale before sign-in:** Tailscale tray icon → Preferences → **Run unattended**.
-3. **No lock, no sleep:** Settings → Accounts → Sign-in options → require sign-in again → **Never**. Settings → System → Power → sleep → **Never** (turning the screen off is fine).
+Untick it to remove the service. If you decline the admin prompt, ORBIT falls back to starting at sign-in (no lock screen).
+
+For restarts with nobody at the PC, also set **Tailscale before sign-in**: Tailscale tray icon → Preferences → **Run unattended**, and set sleep to **Never** (Settings → System → Power; turning the screen off is fine).
 
 ### Updates
 
@@ -164,14 +167,13 @@ How a device gets on the list, once:
 - One remote screen at a time (switch with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd>).
 - Your own pointer stands in for the remote one (which is why it feels instant); it takes the remote pointer's shape: I-beam, resize arrows, hand, hidden during video.
 - <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
-- The sharing PC must stay **unlocked**: the lock screen and UAC prompts can't be captured by a normal app. ORBIT waits and resumes on unlock.
+- Without **SHARE AUTOMATICALLY**, the lock screen and UAC prompts can't be captured (Windows reserves them for services); ORBIT waits and resumes on unlock.
 - To control apps running as administrator, run ORBIT as administrator on the sharing PC.
 - On hybrid laptops used for sharing, frames are copied from the integrated GPU to the NVIDIA GPU (a few ms extra).
 
 ## Roadmap
 
 - [ ] Lower resolution automatically on very slow links
-- [ ] Lock screen and UAC capture (Windows service)
 
 ## Build from source
 

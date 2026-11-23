@@ -23,7 +23,7 @@
       (from `tailscale status --json`, every 5 s), so high latency explains itself.
 - [x] Adaptive bitrate (milestone 4): server/src/rate.rs, from RTT, loss and net wait.
 - [ ] Tune adaptive bitrate on the real relayed link (recovery after a deep cut is slow).
-- [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).
+- [x] Share the lock screen / UAC prompts: ORBIT Service + Agent (SHARE AUTOMATICALLY), Ctrl+Alt+Del via SendSAS.
 - [x] Pairing / auth (milestone 5): ID certificates, paired-device list, own-account auto-pair, 6-digit code (SPAKE2), known-PC check.
 - [x] Clipboard sync: text and images both ways (xfer crate, one QUIC stream per item).
 - [x] Send files: drag onto the viewer, or copy/paste in Explorer; paced to leave the video room.
