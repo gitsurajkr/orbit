@@ -783,7 +783,7 @@ impl App {
             Some(target) => target,
             None => always || self.cfg.autostart,
         };
-        if widgets::check(ui, &mut on, "SHARE AUTOMATICALLY · EVEN ON THE LOCK SCREEN") && busy.is_none() {
+        if widgets::check(ui, &mut on, "START ORBIT WHEN WINDOWS STARTS") && busy.is_none() {
             if on {
                 if let Some(s) = self.server.take() {
                     s.stop(); // the service takes over the port
@@ -813,9 +813,9 @@ impl App {
         }
         ui.label(
             RichText::new(match (always, self.cfg.autostart) {
-                (true, _) => "      FROM WINDOWS' START, LOCK SCREEN + UAC INCLUDED",
+                (true, _) => "      RUNNING · LOCK SCREEN + UAC INCLUDED",
                 (false, true) => "      AFTER YOU SIGN IN (NOT ON THE LOCK SCREEN)",
-                _ => "      STARTS WITH WINDOWS, EVEN BEFORE YOU SIGN IN",
+                _ => "      ALSO WORKS ON THE LOCK SCREEN",
             })
             .font(FontId::monospace(9.5))
             .color(gray(120)),
@@ -896,7 +896,7 @@ impl App {
             None => ("ON", "ALWAYS ON"),
         };
         if widgets::orbit_button(ui, "share", big, sub, busy.is_none(), busy.is_none()).clicked() {
-            self.share_error = Some("ORBIT SHARES THIS PC AUTOMATICALLY NOW. UNTICK SHARE AUTOMATICALLY TO STOP".into());
+            self.share_error = Some("ORBIT SHARES THIS PC AUTOMATICALLY NOW. UNTICK START ORBIT WHEN WINDOWS STARTS TO STOP".into());
         }
         if busy.is_some() {
             widgets::status_line(ui, "WAITING FOR WINDOWS' ADMIN PERMISSION...", true);

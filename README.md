@@ -99,9 +99,9 @@ ORBIT sits in the **notification area** next to the clock:
 - **Hover** to see what it's doing, e.g. `ORBIT · SHARING · 100.x.y.z CONNECTED`.
 - The window's **─** and **✕** buttons send ORBIT to the tray, so sharing keeps running. Quit from the tray menu.
 
-### Share automatically, even on the lock screen
+### Start ORBIT when Windows starts (lock screen included)
 
-On the sharing PC, tick **SHARE AUTOMATICALLY · EVEN ON THE LOCK SCREEN** in the SHARE tab and allow Windows' admin prompt once. ORBIT then shares through a small Windows service (*ORBIT Remote Desktop*) that:
+On the sharing PC, tick **START ORBIT WHEN WINDOWS STARTS** in the SHARE tab and allow Windows' admin prompt once. ORBIT then shares through a small Windows service (*ORBIT Remote Desktop*) that:
 
 - starts with Windows, **before anyone signs in**, so you can sign in remotely after a restart;
 - shows and controls the **lock screen, sign-in screen and UAC prompts**;
@@ -167,7 +167,7 @@ How a device gets on the list, once:
 - One remote screen at a time (switch with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd>).
 - Your own pointer stands in for the remote one (which is why it feels instant); it takes the remote pointer's shape: I-beam, resize arrows, hand, hidden during video.
 - <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
-- Without **SHARE AUTOMATICALLY**, the lock screen and UAC prompts can't be captured (Windows reserves them for services); ORBIT waits and resumes on unlock.
+- Without **START ORBIT WHEN WINDOWS STARTS**, the lock screen and UAC prompts can't be captured (Windows reserves them for services); ORBIT waits and resumes on unlock.
 - To control apps running as administrator, run ORBIT as administrator on the sharing PC.
 - On hybrid laptops used for sharing, frames are copied from the integrated GPU to the NVIDIA GPU (a few ms extra).
 
