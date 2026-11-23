@@ -66,6 +66,44 @@ pub fn follow_input_desktop() -> bool {
     }
 }
 
+/// Presses Ctrl+Alt+Del (`SendSAS` from sas.dll). Windows only allows it for services and
+/// SYSTEM processes, and only with the SoftwareSASGeneration policy (set when the ORBIT Service
+/// is installed). Returns false where that isn't the case.
+pub fn send_ctrl_alt_del() -> bool {
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    if !running_as_system() {
+        return false;
+    }
+    // Windows accepts SendSAS only from the service process itself, not from the agent it
+    // started: ask the service (it waits on this event).
+    unsafe {
+        if let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, &windows::core::HSTRING::from(SAS_EVENT)) {
+            let ok = SetEvent(ev).is_ok();
+            let _ = windows::Win32::Foundation::CloseHandle(ev);
+            if ok {
+                return true;
+            }
+        }
+    }
+    sas_now()
+}
+
+/// Name of the event the ORBIT Service waits on to press Ctrl+Alt+Del.
+pub const SAS_EVENT: &str = r"Global\ORBIT-SAS";
+
+/// Calls `SendSAS` in this process (works in the service process).
+pub fn sas_now() -> bool {
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("sas.dll")) else { return false };
+        let Some(f) = GetProcAddress(lib, s!("SendSAS")) else { return false };
+        let send: extern "system" fn(windows::Win32::Foundation::BOOL) = std::mem::transmute(f);
+        send(false.into()); // false: as a service, not an Ease of Access app
+    }
+    true
+}
+
 /// True if this process runs as the SYSTEM account (the ORBIT Agent).
 pub fn running_as_system() -> bool {
     use windows::Win32::Security::*;

@@ -94,6 +94,7 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
         })
     });
     if !view_only {
+        ctrl_alt_del_menu(hwnd);
         // Files dragged onto the window go to the sharing PC's Downloads\ORBIT.
         unsafe { windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true) };
     }
@@ -235,6 +236,16 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
 
 /// First window-menu id for "Screen N" (ids step by 16: Windows uses the low 4 bits).
 const MENU_SCREEN: usize = 0x1000;
+const MENU_CTRL_ALT_DEL: usize = 0x2000;
+
+/// Adds "Send Ctrl+Alt+Del" to the window menu (Alt+Space / right-click the title bar).
+fn ctrl_alt_del_menu(hwnd: HWND) {
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_CTRL_ALT_DEL, &HSTRING::from("Send Ctrl+Alt+Del"));
+    }
+}
 
 /// Lists the sharing PC's screens in the window menu (Alt+Space / right-click the title bar),
 /// with a check on the one shown.
@@ -495,6 +506,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 None => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            WM_SYSCOMMAND if (wp.0 & 0xFFF0) == MENU_CTRL_ALT_DEL => {
+                SINK.with(|s| {
+                    if let Ok(s) = s.try_borrow() {
+                        if let Some(s) = s.as_ref() {
+                            let _ = s.ctrl.send(Ctrl::SecureAttention);
+                        }
+                    }
+                });
+                LRESULT(0)
+            }
             // "Screen N" entries we added to the window menu.
             WM_SYSCOMMAND if (MENU_SCREEN..MENU_SCREEN + 16 * 9).contains(&(wp.0 & 0xFFF0)) => {
                 let index = ((wp.0 & 0xFFF0) - MENU_SCREEN) / 16;

@@ -60,6 +60,8 @@ struct App {
     gate: Arc<auth::Gate>,
     /// The PAIRED DEVICES box is open.
     devices_open: bool,
+    /// "Always on" sharing by the ORBIT Service (works on the lock screen).
+    always: crate::always_on::AlwaysOn,
     /// A device whose REMOVE was clicked once (click again to confirm).
     removing: Option<auth::Fingerprint>,
     server: Option<server::ServerHandle>,
@@ -113,6 +115,7 @@ impl App {
             identity: auth::Identity::load_or_create().map_err(|e| format!("{e:#}")),
             gate: auth::Gate::load(),
             devices_open: false,
+            always: crate::always_on::AlwaysOn::start(&cc.egui_ctx),
             removing: None,
             server: None,
             share_error: None,
@@ -310,13 +313,19 @@ impl App {
     /// PAIRED DEVICES: who may connect to this PC, and the code for a new device.
     fn devices_dialog(&mut self, ctx: &egui::Context) {
         let mut close = false;
-        let devices = self.gate.devices();
-        let mut trust_own = self.gate.trust_own_account();
-        let pin = self.gate.pin();
-        let sharing = self.server.is_some();
+        // With "always on", the service's list is the one that counts.
+        let agent = if self.always.running() { self.always.devices() } else { None };
+        let (devices, mut trust_own, pin) = match &agent {
+            Some(a) => (a.devices.clone(), a.trust_own, a.pin.clone()),
+            None => (self.gate.devices(), self.gate.trust_own_account(), self.gate.pin()),
+        };
+        let sharing = self.server.is_some() || self.always.running();
         let (mut remove, mut start_pin, mut cancel_pin, mut toggled) = (None, false, false, false);
         let removing = self.removing;
-        let my_id = self.identity.as_ref().map(|i| auth::short(&i.fingerprint())).unwrap_or_default();
+        let my_id = match &agent {
+            Some(a) => a.id.clone(),
+            None => self.identity.as_ref().map(|i| auth::short(&i.fingerprint())).unwrap_or_default(),
+        };
         let outside = modal(ctx, "devices", |ui| {
             ui.label(RichText::new("PAIRED DEVICES").font(FontId::monospace(20.0)).color(W));
             ui.add_space(4.0);
@@ -374,22 +383,39 @@ impl App {
             });
         });
         close |= outside;
+        let via_agent = agent.is_some();
         match remove {
             Some((fp, true)) => {
-                self.gate.remove(&fp);
+                if via_agent {
+                    self.always.command(serde_json::json!({"cmd": "remove", "fp": auth::hex(&fp)}));
+                } else {
+                    self.gate.remove(&fp);
+                }
                 self.removing = None;
             }
             Some((fp, false)) => self.removing = Some(fp),
             None => {}
         }
         if toggled {
-            self.gate.set_trust_own_account(trust_own);
+            if via_agent {
+                self.always.command(serde_json::json!({"cmd": "trust_own", "on": trust_own}));
+            } else {
+                self.gate.set_trust_own_account(trust_own);
+            }
         }
         if start_pin {
-            self.gate.start_pin();
+            if via_agent {
+                self.always.command(serde_json::json!({"cmd": "pin_start"}));
+            } else {
+                self.gate.start_pin();
+            }
         }
         if cancel_pin {
-            self.gate.cancel_pin();
+            if via_agent {
+                self.always.command(serde_json::json!({"cmd": "pin_cancel"}));
+            } else {
+                self.gate.cancel_pin();
+            }
         }
         if close || (self.prompt.is_none() && ctx.input(|i| i.key_pressed(Key::Escape))) {
             self.devices_open = false;
@@ -421,6 +447,11 @@ impl App {
     fn tray_tip(&self) -> String {
         if self.viewer.is_some() {
             format!("ORBIT · CONNECTED TO {}", self.viewer_addr)
+        } else if self.always.running() {
+            match self.always.status().and_then(|v| v["client_name"].as_str().map(String::from)) {
+                Some(n) => format!("ORBIT · ALWAYS ON · {n} CONNECTED"),
+                None => "ORBIT · ALWAYS ON · WAITING".into(),
+            }
         } else if let Some(s) = &self.server {
             let st = s.status.get();
             match (st.client_name, st.client) {
@@ -535,6 +566,10 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         // Auto-share: keep trying (Tailscale and the network can take a while after boot).
+        self.always.poll();
+        if self.always.running() {
+            self.auto_share_at = None; // the service shares this PC
+        }
         if self.cfg.autostart && self.server.is_none() && !self.user_stopped && self.auto_share_at.is_some_and(|t| Instant::now() >= t) {
             self.toggle_share();
             self.auto_share_at = if self.server.is_some() { None } else { Some(Instant::now() + Duration::from_secs(5)) };
@@ -686,7 +721,9 @@ impl App {
     }
 
     fn share_tab(&mut self, ui: &mut egui::Ui) {
-        let sharing = self.server.is_some();
+        let always = self.always.running();
+        // With "always on" the settings stay editable: they're sent to the service.
+        let sharing = self.server.is_some() && !always;
         label(ui, "THIS PC'S TAILSCALE IP · TYPE IT ON THE OTHER PC");
         ui.add_space(4.0);
         match self.tailscale_ip.clone() {
@@ -712,41 +749,96 @@ impl App {
         let fps_labels: Vec<String> = FPS_OPTIONS.iter().map(|f| format!("{f}")).collect();
         if widgets::segmented(ui, &fps_labels, &mut self.cfg.fps_index, !sharing) {
             self.cfg.save();
+            if always {
+                self.always.command(serde_json::json!({"cmd": "settings", "fps": FPS_OPTIONS[self.cfg.fps_index]}));
+            }
         }
         ui.add_space(10.0);
         label(ui, &format!("BITRATE · {:.0} MBIT/S", self.cfg.mbps));
         ui.add_space(2.0);
-        ui.add_enabled_ui(!sharing, |ui| {
+        let slider = ui.add_enabled_ui(!sharing, |ui| {
             ui.spacing_mut().slider_width = ui.available_width();
-            ui.add(egui::Slider::new(&mut self.cfg.mbps, 2.0..=100.0).show_value(false));
+            ui.add(egui::Slider::new(&mut self.cfg.mbps, 2.0..=100.0).show_value(false))
         });
+        if always && slider.inner.drag_stopped() {
+            self.cfg.save();
+            self.always.command(serde_json::json!({"cmd": "settings", "mbps": self.cfg.mbps}));
+        }
         if self.monitors.len() > 1 {
             ui.add_space(10.0);
             label(ui, "SCREEN");
             ui.add_space(4.0);
             let mons: Vec<String> = (1..=self.monitors.len()).map(|i| format!("{i}")).collect();
-            widgets::segmented(ui, &mons, &mut self.monitor, !sharing);
-        }
-
-        let mut auto = self.cfg.autostart;
-        if widgets::check(ui, &mut auto, "START SHARING WHEN WINDOWS STARTS") {
-            match crate::autostart::set(auto) {
-                Ok(()) => {
-                    self.cfg.autostart = auto;
-                    self.cfg.save();
-                }
-                Err(e) => self.share_error = Some(format!("{e:#}")),
+            if widgets::segmented(ui, &mons, &mut self.monitor, !sharing) && always {
+                self.always.command(serde_json::json!({"cmd": "settings", "monitor": self.monitor}));
             }
         }
 
-        let n = self.gate.devices().len();
-        let pairing = if self.gate.pin().is_some() { " · CODE SHOWING" } else { "" };
+        // One switch for "share without me pressing SHARE". Done by the ORBIT Service, which
+        // starts before sign-in and also shares the lock screen and UAC prompts (Windows asks for
+        // admin permission once). If that permission is declined: the old way, sharing starts
+        // when this user signs in.
+        let busy = self.always.busy();
+        let mut on = match busy {
+            Some(target) => target,
+            None => always || self.cfg.autostart,
+        };
+        if widgets::check(ui, &mut on, "SHARE AUTOMATICALLY · EVEN ON THE LOCK SCREEN") && busy.is_none() {
+            if on {
+                if let Some(s) = self.server.take() {
+                    s.stop(); // the service takes over the port
+                }
+                let settings = crate::service::AgentSettings { fps: FPS_OPTIONS[self.cfg.fps_index], mbps: self.cfg.mbps, monitor: self.monitor };
+                self.always.set(true, &settings);
+            } else {
+                if always {
+                    self.always.set(false, &crate::service::load_agent_settings());
+                }
+                self.set_login_autostart(false);
+            }
+        }
+        if self.always.take_turned_off() {
+            self.gate = auth::Gate::load(); // the service's paired devices were copied back
+        }
+        if self.always.take_declined() {
+            // No admin permission: start with Windows the old way (no lock screen).
+            self.set_login_autostart(true);
+            self.share_error = Some("WITHOUT ADMIN PERMISSION ORBIT SHARES AFTER YOU SIGN IN, BUT NOT ON THE LOCK SCREEN".into());
+            if self.server.is_none() {
+                self.toggle_share();
+            }
+        }
+        if always && self.cfg.autostart {
+            self.set_login_autostart(false); // the service does it now
+        }
+        ui.label(
+            RichText::new(match (always, self.cfg.autostart) {
+                (true, _) => "      FROM WINDOWS' START, LOCK SCREEN + UAC INCLUDED",
+                (false, true) => "      AFTER YOU SIGN IN (NOT ON THE LOCK SCREEN)",
+                _ => "      STARTS WITH WINDOWS, EVEN BEFORE YOU SIGN IN",
+            })
+            .font(FontId::monospace(9.5))
+            .color(gray(120)),
+        );
+
+        let (n, pin_showing) = match self.always.devices().filter(|_| always) {
+            Some(a) => (a.devices.len(), a.pin.is_some()),
+            None => (self.gate.devices().len(), self.gate.pin().is_some()),
+        };
+        let pairing = if pin_showing { " · CODE SHOWING" } else { "" };
         if widgets::chip(ui, &format!("PAIRED DEVICES · {n}{pairing}  >")).clicked() {
             self.devices_open = true;
         }
 
+        if always || self.always.busy().is_some() {
+            self.always_on_status(ui);
+            return;
+        }
         if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
             self.toggle_share();
+        }
+        if let Some(e) = &self.always.error {
+            widgets::notice(ui, &e.to_uppercase());
         }
         let status = self.server.as_ref().map(|s| s.status.get());
         match status {
@@ -776,6 +868,62 @@ impl App {
                     ui.label(RichText::new("ONLY PAIRED DEVICES ON YOUR TAILNET CAN CONNECT").font(FontId::monospace(10.5)).color(gray(100)));
                 }
             }
+        }
+    }
+}
+
+impl App {
+    /// The old per-user "start with Windows" (registry Run entry + auto-share).
+    fn set_login_autostart(&mut self, on: bool) {
+        if self.cfg.autostart == on {
+            return;
+        }
+        match crate::autostart::set(on) {
+            Ok(()) => {
+                self.cfg.autostart = on;
+                self.cfg.save();
+            }
+            Err(e) => self.share_error = Some(format!("{e:#}")),
+        }
+    }
+
+    /// SHARE tab below the settings while the ORBIT Service shares this PC.
+    fn always_on_status(&mut self, ui: &mut egui::Ui) {
+        let busy = self.always.busy();
+        let (big, sub) = match busy {
+            Some(true) => ("...", "TURNING ON"),
+            Some(false) => ("...", "TURNING OFF"),
+            None => ("ON", "ALWAYS ON"),
+        };
+        if widgets::orbit_button(ui, "share", big, sub, busy.is_none(), busy.is_none()).clicked() {
+            self.share_error = Some("ORBIT SHARES THIS PC AUTOMATICALLY NOW. UNTICK SHARE AUTOMATICALLY TO STOP".into());
+        }
+        if busy.is_some() {
+            widgets::status_line(ui, "WAITING FOR WINDOWS' ADMIN PERMISSION...", true);
+            return;
+        }
+        match self.always.status() {
+            Some(v) => {
+                let s = |k: &str| v[k].as_str().map(String::from);
+                match (s("client_name"), s("client")) {
+                    (Some(n), Some(c)) => widgets::status_line(ui, &format!("CONNECTED · {n} · {}", c.split(':').next().unwrap_or(&c)), true),
+                    (_, Some(c)) => widgets::status_line(ui, &format!("{} IS CONNECTING...", c.split(':').next().unwrap_or(&c)), true),
+                    _ => widgets::status_line(ui, "ALWAYS ON · WAITING FOR THE OTHER PC...", true),
+                }
+                if let Some(st) = s("stats") {
+                    ui.label(RichText::new(st).font(FontId::monospace(10.5)).color(gray(170)));
+                }
+                if let Some(t) = s("transfer") {
+                    widgets::status_line(ui, &t, true);
+                }
+                if let Some(e) = s("error") {
+                    widgets::notice(ui, &e.to_uppercase());
+                }
+            }
+            None => widgets::status_line(ui, "STARTING THE ORBIT SERVICE...", true),
+        }
+        if let Some(e) = self.always.error.clone().or(self.share_error.clone()) {
+            widgets::notice(ui, &e.to_uppercase());
         }
     }
 }

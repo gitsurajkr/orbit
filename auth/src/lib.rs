@@ -43,11 +43,11 @@ pub fn short(fp: &Fingerprint) -> String {
     fp[..8].chunks(2).map(|c| format!("{:02X}{:02X}", c[0], c[1])).collect::<Vec<_>>().join("-")
 }
 
-fn hex(b: &[u8]) -> String {
+pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Fingerprint> {
+pub fn unhex(s: &str) -> Option<Fingerprint> {
     if s.len() != 64 {
         return None;
     }
@@ -94,19 +94,38 @@ impl Identity {
 
     /// Loads `identity.bin`, or creates and saves a new identity the first time.
     pub fn load_or_create() -> Result<Identity> {
-        let path = dir()?.join("identity.bin");
-        if let Ok(blob) = std::fs::read(&path) {
-            match dpapi::unprotect(&blob).and_then(|b| Identity::decode(&b)) {
-                Ok(id) => return Ok(id),
-                // Copied from another PC or account, or damaged: a new identity means paired
-                // PCs will ask again, which is the safe outcome.
-                Err(e) => eprintln!("identity.bin unreadable ({e:#}); making a new identity"),
-            }
+        Self::load_or_create_in(&dir()?, false)
+    }
+
+    /// Loads `identity.bin` from `dir` (encrypted for this user or for this machine; both
+    /// read), or creates one, encrypted for the machine if `machine_scope` (the service's
+    /// folder: there the folder's permissions keep it private).
+    pub fn load_or_create_in(dir: &std::path::Path, machine_scope: bool) -> Result<Identity> {
+        if let Ok(id) = Self::load_from(dir) {
+            return Ok(id);
         }
         let c = rcgen::generate_simple_self_signed(vec!["orbit".to_string()])?;
         let id = Identity { cert_der: c.cert.der().to_vec(), key_der: c.key_pair.serialize_der() };
-        write_atomic(&path, &dpapi::protect(&id.encode())?).with_context(|| format!("saving {}", path.display()))?;
+        id.save_in(dir, machine_scope)?;
         Ok(id)
+    }
+
+    /// Reads `dir\identity.bin`.
+    pub fn load_from(dir: &std::path::Path) -> Result<Identity> {
+        let path = dir.join("identity.bin");
+        let blob = std::fs::read(&path)?;
+        dpapi::unprotect(&blob).and_then(|b| Identity::decode(&b)).map_err(|e| {
+            // Copied from another PC or account, or damaged: a new identity means paired PCs
+            // will ask again, which is the safe outcome.
+            eprintln!("{} unreadable ({e:#}); making a new identity", path.display());
+            e
+        })
+    }
+
+    /// Writes `dir\identity.bin`, encrypted for this user, or for this machine.
+    pub fn save_in(&self, dir: &std::path::Path, machine_scope: bool) -> Result<()> {
+        let path = dir.join("identity.bin");
+        write_atomic(&path, &dpapi::protect(&self.encode(), machine_scope)?).with_context(|| format!("saving {}", path.display()))
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -131,7 +150,7 @@ mod dpapi {
     use anyhow::Result;
     use windows::core::w;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
 
     fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
         unsafe {
@@ -141,11 +160,13 @@ mod dpapi {
         }
     }
 
-    /// Encrypts for the current Windows user on this PC only.
-    pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
+    /// Encrypts for the current Windows user on this PC only, or (`machine`) for any process
+    /// on this PC (then the file's permissions must keep it private).
+    pub fn protect(data: &[u8], machine: bool) -> Result<Vec<u8>> {
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let mut out = CRYPT_INTEGER_BLOB::default();
-        unsafe { CryptProtectData(&input, w!("ORBIT identity"), None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)? };
+        let flags = CRYPTPROTECT_UI_FORBIDDEN | if machine { CRYPTPROTECT_LOCAL_MACHINE } else { 0 };
+        unsafe { CryptProtectData(&input, w!("ORBIT identity"), None, None, None, flags, &mut out)? };
         Ok(take(out))
     }
 
@@ -194,7 +215,10 @@ pub struct Gate {
 impl Gate {
     /// Loads `trusted.json` (an empty list if there's none yet).
     pub fn load() -> Arc<Gate> {
-        let path = dir().map(|d| d.join("trusted.json")).unwrap_or_else(|_| "trusted.json".into());
+        Gate::load_path(dir().map(|d| d.join("trusted.json")).unwrap_or_else(|_| "trusted.json".into()))
+    }
+
+    fn load_path(path: PathBuf) -> Arc<Gate> {
         let mut st = GateState { devices: Vec::new(), trust_own_account: true, pin: None };
         if let Some(v) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
             st.trust_own_account = v.get("trust_own_account").and_then(|x| x.as_bool()).unwrap_or(true);
@@ -237,6 +261,24 @@ impl Gate {
         let mut st = self.state.lock().unwrap();
         st.devices.retain(|d| d.fp != fp);
         st.devices.push(Device { name: name.to_string(), fp, paired_unix: now_unix(), how: how.to_string() });
+        self.save(&st);
+    }
+
+    /// Gate for the trusted.json in `dir` (instead of the default folder).
+    pub fn load_in(dir: &std::path::Path) -> Arc<Gate> {
+        let path = dir.join("trusted.json");
+        let g = Gate::load_path(path);
+        g
+    }
+
+    /// Adds every device of `other` not already on this list.
+    pub fn merge_from(&self, other: &Gate) {
+        let mut st = self.state.lock().unwrap();
+        for d in other.devices() {
+            if !st.devices.iter().any(|x| x.fp == d.fp) {
+                st.devices.push(d);
+            }
+        }
         self.save(&st);
     }
 

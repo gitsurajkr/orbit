@@ -26,6 +26,8 @@ pub enum Ctrl {
     PairProof { proof: Vec<u8> },
     /// S→C: connection refused, with the reason to show. The connection closes after it.
     Denied { reason: String },
+    /// C→S: press Ctrl+Alt+Del on the sharing PC (only possible for the ORBIT Agent).
+    SecureAttention,
     /// C→S: frames from `from` on were lost; invalidate them and send a recovery frame.
     RefInvalidate { from: u32 },
     /// C→S. Sent repeatedly (rate-limited) until a keyframe actually arrives.
@@ -128,6 +130,7 @@ mod tag {
     pub const SELECT_MONITOR: u8 = 17;
     pub const VIDEO_FORMAT: u8 = 18;
     pub const REF_INVALIDATE: u8 = 19;
+    pub const SECURE_ATTENTION: u8 = 20;
 }
 
 /// Longest name / reason text carried (bytes, cut at a character boundary).
@@ -216,6 +219,7 @@ impl Ctrl {
                 tag::SERVER_HELLO
             }
             Ctrl::KeyframeRequest => tag::KEYFRAME_REQUEST,
+            Ctrl::SecureAttention => tag::SECURE_ATTENTION,
             Ctrl::Key { scan, extended, down } => {
                 out.extend_from_slice(&scan.to_le_bytes());
                 out.push(extended as u8);
@@ -300,6 +304,7 @@ impl Ctrl {
                 Ctrl::ServerHello { version: u16_at(0), width: u16_at(2), height: u16_at(4), fps: u16_at(6) }
             }
             tag::KEYFRAME_REQUEST => Ctrl::KeyframeRequest,
+            tag::SECURE_ATTENTION => Ctrl::SecureAttention,
             tag::KEY => {
                 need(4)?;
                 Ctrl::Key { scan: u16_at(0), extended: b[2] != 0, down: b[3] != 0 }
@@ -384,6 +389,7 @@ mod tests {
             Ctrl::Monitors { current: 0, list: vec![] },
             Ctrl::SelectMonitor { index: 2 },
             Ctrl::RefInvalidate { from: 0xFFFF_FFF0 },
+            Ctrl::SecureAttention,
             Ctrl::VideoFormat { width: 1920, height: 1080 },
             Ctrl::PairStart { msg: vec![1, 2, 3] },
             Ctrl::PairReply { msg: vec![4; 33] },

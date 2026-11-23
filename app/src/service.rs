@@ -42,11 +42,21 @@ pub fn log_dir() -> PathBuf {
 
 // ───────────────────────────── install / remove ─────────────────────────────
 
-/// Registers and starts the service (needs administrator rights).
-pub fn install() -> Result<()> {
+/// Registers and starts the service (needs administrator rights). `settings` become the
+/// agent's; this user's ID certificate and paired devices are copied to it, so paired PCs
+/// keep connecting without a warning or a new code.
+pub fn install(settings: &AgentSettings) -> Result<()> {
     let exe = std::env::current_exe()?;
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
+    save_agent_settings(settings)?;
+    if auth::Identity::load_from(&dir).is_err() {
+        if let Ok(mine) = auth::Identity::load_or_create() {
+            mine.save_in(&dir, true)?;
+        }
+    }
+    auth::Gate::load_in(&dir).merge_from(&auth::Gate::load());
+    allow_software_sas();
     // Only SYSTEM and administrators may read the agent's key and device list.
     let ok = std::process::Command::new("icacls")
         .arg(&dir)
@@ -94,9 +104,29 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+/// Lets services press Ctrl+Alt+Del (`SendSAS`): the SoftwareSASGeneration policy, raised to
+/// include services (1) without removing what's already allowed (2 = Ease of Access apps).
+fn allow_software_sas() {
+    use windows::core::w;
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        let key = w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System");
+        let mut cur = 0u32;
+        let mut size = 4u32;
+        let _ = RegGetValueW(HKEY_LOCAL_MACHINE, key, w!("SoftwareSASGeneration"), RRF_RT_REG_DWORD, None, Some(&mut cur as *mut u32 as *mut _), Some(&mut size));
+        let want = cur | 1;
+        if want != cur {
+            let _ = RegSetKeyValueW(HKEY_LOCAL_MACHINE, key, w!("SoftwareSASGeneration"), REG_DWORD.0, Some(&want as *const u32 as *const _), 4);
+        }
+    }
+}
+
 /// Stops and removes the service (needs administrator rights). Its folder stays, so turning
-/// it back on keeps the paired devices.
+/// it back on keeps the paired devices; they're also copied back to this user's list.
 pub fn uninstall() -> Result<()> {
+    if data_dir().join("trusted.json").exists() {
+        auth::Gate::load().merge_from(&auth::Gate::load_in(&data_dir()));
+    }
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let Ok(svc) = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE) else {
         return Ok(()); // not installed
@@ -114,9 +144,14 @@ pub fn uninstall() -> Result<()> {
 
 /// Installed and running?
 pub fn status() -> Option<ServiceState> {
-    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
-    let svc = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS).ok()?;
-    Some(svc.query_status().ok()?.current_state)
+    status_detail().ok()
+}
+
+/// The service's state, or why it couldn't be read.
+pub fn status_detail() -> Result<ServiceState> {
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).context("opening the service manager")?;
+    let svc = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS).context("opening the ORBIT service")?;
+    Ok(svc.query_status().context("querying it")?.current_state)
 }
 
 // ───────────────────────────── the service ─────────────────────────────
@@ -159,6 +194,10 @@ fn service_main(_args: Vec<OsString>) {
 
 /// Keeps one agent running in the console session until `stop`.
 fn supervise(stop: &AtomicBool) {
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    // The agent asks for Ctrl+Alt+Del through this event (only the service may press it).
+    // Default security: SYSTEM and administrators only.
+    let sas = unsafe { CreateEventW(None, false, false, &windows::core::HSTRING::from(server::desktop::SAS_EVENT)) }.ok();
     let mut agent: Option<(u32, spawn::Child)> = None; // (session, process)
     let mut last_try = Instant::now() - Duration::from_secs(60);
     while !stop.load(Ordering::Acquire) {
@@ -177,7 +216,13 @@ fn supervise(stop: &AtomicBool) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        match sas {
+            Some(ev) if unsafe { WaitForSingleObject(ev, 500) } == windows::Win32::Foundation::WAIT_OBJECT_0 => {
+                log(&format!("Ctrl+Alt+Del: {}", if server::desktop::sas_now() { "sent" } else { "failed" }));
+            }
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(500)),
+        }
     }
     if let Some((_, c)) = agent {
         c.kill();
@@ -269,6 +314,12 @@ pub struct AgentSettings {
     pub monitor: usize,
 }
 
+pub fn save_agent_settings(s: &AgentSettings) -> Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(data_dir().join("agent.cfg"), format!("fps={}\nmbps={}\nmonitor={}\n", s.fps, s.mbps, s.monitor))?;
+    Ok(())
+}
+
 pub fn load_agent_settings() -> AgentSettings {
     let mut s = AgentSettings { fps: 60, mbps: 20.0, monitor: 0 };
     if let Ok(t) = std::fs::read_to_string(data_dir().join("agent.cfg")) {
@@ -329,10 +380,19 @@ pub fn run_agent() -> Result<()> {
     std::env::set_var("ORBIT_DOWNLOADS", user_downloads(session));
     println!("ORBIT agent v{} | session {session} | SYSTEM: {} | input desktop: {:?}", env!("CARGO_PKG_VERSION"), server::desktop::running_as_system(), server::desktop::input_desktop_name());
     server::dpi_aware();
-    let cfg = load_agent_settings();
-    let identity = auth::Identity::load_or_create()?;
+    let identity = auth::Identity::load_or_create_in(&dir, true)?;
     let gate = auth::Gate::load();
+    let current: Arc<std::sync::Mutex<Option<Arc<server::Status>>>> = Arc::default();
+    let restart = Arc::new(AtomicBool::new(false));
+    {
+        let (gate, current, restart, id) = (gate.clone(), current.clone(), restart.clone(), auth::short(&identity.fingerprint()));
+        std::thread::Builder::new().name("pipe".into()).spawn(move || {
+            crate::pipe::serve(|req| agent_request(req, &gate, &current, &restart, &id), || crate::pipe::session_user_sid(session));
+        })?;
+    }
     loop {
+        let cfg = load_agent_settings();
+        restart.store(false, Ordering::Release);
         let start = || -> Result<server::ServerHandle> {
             let monitor = server::preflight(cfg.monitor)?;
             let settings = server::Settings { monitor, fps: cfg.fps, bitrate_bps: (cfg.mbps * 1e6) as u32, identity: identity.clone(), gate: gate.clone() };
@@ -340,10 +400,17 @@ pub fn run_agent() -> Result<()> {
         };
         match start() {
             Ok(h) => {
-                println!("sharing on {} | ID {}", h.bind, auth::short(&identity.fingerprint()));
+                println!("sharing on {} | {} fps, {} Mbit/s, screen {} | ID {}", h.bind, cfg.fps, cfg.mbps, cfg.monitor + 1, auth::short(&identity.fingerprint()));
+                *current.lock().unwrap() = Some(h.status.clone());
                 let mut last = String::new();
                 loop {
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(250));
+                    if restart.load(Ordering::Acquire) {
+                        println!("settings changed: restarting sharing");
+                        current.lock().unwrap().take();
+                        h.stop();
+                        break;
+                    }
                     let st = h.status.get();
                     let line = format!("{:?} {:?} {:?}", st.client_name, st.error, server::desktop::input_desktop_name());
                     if line != last {
@@ -357,5 +424,63 @@ pub fn run_agent() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
+    }
+}
+
+/// Answers one request from the app (see pipe.rs).
+fn agent_request(req: &serde_json::Value, gate: &auth::Gate, current: &std::sync::Mutex<Option<Arc<server::Status>>>, restart: &AtomicBool, id: &str) -> serde_json::Value {
+    use serde_json::json;
+    let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+    match cmd {
+        "status" => {
+            let st = current.lock().unwrap().as_ref().map(|s| s.get()).unwrap_or_default();
+            let cfg = load_agent_settings();
+            let devices: Vec<_> = gate.devices().iter().map(|d| json!({"name": d.name, "fp": auth::hex(&d.fp), "how": d.how, "paired": d.paired_unix})).collect();
+            let pin = gate.pin().map(|(code, left)| json!({"code": code, "left": left.as_secs()}));
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "id": id,
+                "client": st.client, "client_name": st.client_name, "stats": st.stats, "transfer": st.transfer, "error": st.error.map(|e| format!("{e}")),
+                "devices": devices, "trust_own": gate.trust_own_account(), "pin": pin,
+                "fps": cfg.fps, "mbps": cfg.mbps, "monitor": cfg.monitor,
+                "desktop": server::desktop::input_desktop_name(),
+            })
+        }
+        "remove" => match req.get("fp").and_then(|f| f.as_str()).and_then(auth::unhex) {
+            Some(fp) => {
+                gate.remove(&fp);
+                json!({"ok": true})
+            }
+            None => json!({"error": "bad fingerprint"}),
+        },
+        "trust_own" => {
+            gate.set_trust_own_account(req.get("on").and_then(|v| v.as_bool()).unwrap_or(true));
+            json!({"ok": true})
+        }
+        "pin_start" => json!({"code": gate.start_pin()}),
+        "pin_cancel" => {
+            gate.cancel_pin();
+            json!({"ok": true})
+        }
+        "settings" => {
+            let mut cfg = load_agent_settings();
+            if let Some(v) = req.get("fps").and_then(|v| v.as_u64()) {
+                cfg.fps = (v as u32).clamp(15, 240);
+            }
+            if let Some(v) = req.get("mbps").and_then(|v| v.as_f64()) {
+                cfg.mbps = (v as f32).clamp(1.0, 200.0);
+            }
+            if let Some(v) = req.get("monitor").and_then(|v| v.as_u64()) {
+                cfg.monitor = v as usize;
+            }
+            match save_agent_settings(&cfg) {
+                Ok(()) => {
+                    restart.store(true, Ordering::Release);
+                    json!({"ok": true})
+                }
+                Err(e) => json!({"error": format!("{e:#}")}),
+            }
+        }
+        _ => json!({"error": format!("unknown request {cmd:?}")}),
     }
 }

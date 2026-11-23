@@ -58,4 +58,46 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [UninstallRun]
+; "Always on" (the ORBIT Service): remove it before the files go.
+Filename: "{app}\{#AppExe}"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
+
+[Code]
+// "Always on" sharing runs orbit.exe as a Windows service, which keeps the file in use: stop
+// it before replacing the files, and start it again afterwards (in-app updates included).
+var
+  ServiceWasInstalled: Boolean;
+
+function ServiceInstalled(): Boolean;
+var
+  Code: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\sc.exe'), 'query ORBIT', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code, I: Integer;
+begin
+  ServiceWasInstalled := ServiceInstalled();
+  if ServiceWasInstalled then
+  begin
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop ORBIT', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    // Wait until it has stopped (and with it the agent), up to ~10 s.
+    for I := 1 to 20 do
+    begin
+      Sleep(500);
+      Exec(ExpandConstant('{cmd}'), '/C sc query ORBIT | find "STOPPED"', '', SW_HIDE, ewWaitUntilTerminated, Code);
+      if Code = 0 then Break;
+    end;
+  end;
+  Result := '';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code: Integer;
+begin
+  if (CurStep = ssPostInstall) and ServiceWasInstalled then
+    Exec(ExpandConstant('{sys}\sc.exe'), 'start ORBIT', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;

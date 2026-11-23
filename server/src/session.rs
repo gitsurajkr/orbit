@@ -390,6 +390,10 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         loop {
             match read_ctrl(&mut recv).await? {
                 Ctrl::KeyframeRequest => shared.force_idr.store(true, Ordering::Release),
+                Ctrl::SecureAttention => {
+                    let ok = crate::desktop::send_ctrl_alt_del();
+                    println!("Ctrl+Alt+Del requested: {}", if ok { "sent" } else { "not possible here (needs ORBIT's always-on service)" });
+                }
                 Ctrl::RefInvalidate { from } => {
                     let mut pending = shared.invalidate.lock().unwrap();
                     // Several requests before the next frame: repair from the oldest loss.

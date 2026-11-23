@@ -10,9 +10,11 @@
 
 #![windows_subsystem = "windows"]
 
+mod always_on;
 mod autostart;
 mod config;
 mod icon;
+mod pipe;
 mod service;
 mod tray;
 mod ui;
@@ -41,8 +43,22 @@ fn main() {
         }
         return;
     }
+    if flag("--service-status") {
+        println!("service: {:?}", service::status_detail().map_err(|e| format!("{e:#}")));
+        match pipe::call(&serde_json::json!({"cmd": "status"})) {
+            Ok(v) => println!("agent: {v}"),
+            Err(e) => println!("agent: {e:#}"),
+        }
+        return;
+    }
     if flag("--install-service") || flag("--uninstall-service") {
-        let r = if flag("--install-service") { service::install() } else { service::uninstall() };
+        let num = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
+        let settings = service::AgentSettings {
+            fps: num("--fps").map_or(60, |v| v as u32),
+            mbps: num("--mbps").map_or(20.0, |v| v as f32),
+            monitor: num("--monitor").map_or(0, |v| v as usize),
+        };
+        let r = if flag("--install-service") { service::install(&settings) } else { service::uninstall() };
         if let Err(e) = r {
             eprintln!("{e:#}");
             std::process::exit(1);
