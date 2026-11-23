@@ -151,11 +151,7 @@ flowchart LR
 4. **Send** — as QUIC datagrams that are never resent, so nothing old ever blocks something new.
 5. **Show** — your GPU decodes it and puts it on screen immediately.
 
-<details>
-<summary><b>Performance numbers</b></summary>
-<br>
-
-Measured, not estimated:
+**Performance numbers** — measured, not estimated:
 
 | Setup | Result |
 |---|---|
@@ -166,9 +162,7 @@ Measured, not estimated:
 | 300 MB file transfer during a stream | Video stays at 55–59 fps; the transfer only uses spare bandwidth |
 | Laptop locked mid-stream | Lock screen streamed at **55–59 fps**, no interruption |
 
-Latency is measured from capture on one PC to display on the other, with synchronised clocks, not counting the monitor's own delay.
-
-</details>
+<sub>Latency is measured from capture on one PC to display on the other, with synchronised clocks, not counting the monitor's own delay.</sub>
 
 <details>
 <summary><b>Reading the stats</b></summary>
