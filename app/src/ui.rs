@@ -410,7 +410,7 @@ impl App {
         for a in actions {
             match a {
                 "ts_download" => open_url("https://tailscale.com/download/windows"),
-                "orbit_download" => open_url("https://github.com/gitsurajkr/orbit/releases/latest"),
+                "orbit_download" => open_url("https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe"),
                 "ts_machines" => open_url("https://login.tailscale.com/admin/machines"),
                 "gmail" => open_url("https://mail.google.com"),
                 "copy_ip" => {

@@ -17,11 +17,7 @@ connects over [Tailscale](https://tailscale.com), and stays smooth when the netw
 
 <br>
 
-**[⬇ Download the installer](https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe)**
-&nbsp;·&nbsp;
-[Portable orbit.exe](https://github.com/gitsurajkr/orbit/releases/latest/download/orbit.exe)
-&nbsp;·&nbsp;
-[All releases](https://github.com/gitsurajkr/orbit/releases)
+### [⬇ Download ORBIT for Windows](https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe)
 
 </div>
 
@@ -88,6 +84,8 @@ connects over [Tailscale](https://tailscale.com), and stays smooth when the netw
 | **4** | On your PC: **CONNECT** → click its name under **ONLINE** → you're in |
 
 No codes, nothing else. Your own devices recognise each other.
+
+<sub>Can't install on a PC (office, school)? Each release also has a portable <a href="https://github.com/gitsurajkr/orbit/releases/latest/download/orbit.exe">orbit.exe</a> that runs without installing. It can do everything except the lock screen and UAC prompts.</sub>
 
 ### A friend's PC (two Gmails)
 
