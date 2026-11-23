@@ -146,7 +146,7 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 ## Known limits
 
 - One monitor at a time. No clipboard sync yet.
-- The remote cursor shape isn't shown; your own pointer is used (which is also why it feels instant).
+- Your own pointer stands in for the remote one (which is why it feels instant); it takes the remote pointer's shape: I-beam, resize arrows, hand, hidden during video.
 - <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
 - The sharing PC must stay **unlocked**: the lock screen and UAC prompts can't be captured by a normal app. ORBIT waits and resumes on unlock.
 - To control apps running as administrator, run ORBIT as administrator on the sharing PC.
@@ -158,7 +158,6 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 - [ ] Lower resolution automatically on very slow links
 - [ ] Pairing with a PIN and certificate pinning
 - [ ] Clipboard sync and multi-monitor switching
-- [ ] Remote cursor shape
 - [ ] Lock screen and UAC capture (Windows service)
 
 ## Build from source

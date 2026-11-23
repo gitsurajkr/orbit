@@ -1,12 +1,12 @@
 //! The viewer window: connects, decodes, presents, forwards input.
 
-use crate::{decode, keyhook, net, render};
+use crate::{cursor, decode, keyhook, net, render};
 use anyhow::{Context, Result};
 use proto::clock::now_us;
 use proto::ctrl::{Ctrl, MouseMove};
 use proto::stats::{mbit_per_s, Dist, Ticker};
 use proto::video::Frame;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
@@ -40,6 +40,9 @@ struct InputSink {
 
 thread_local! {
     static SINK: RefCell<Option<InputSink>> = const { RefCell::new(None) };
+    /// The remote pointer's shape for our client area (null = hidden); `None` until the server
+    /// says, and always in view-only mode (the local pointer doesn't stand for the remote one).
+    static CURSOR: Cell<Option<HCURSOR>> = const { Cell::new(None) };
 }
 
 /// Connects to `server` (IP or name, optional `:port`) and runs the viewer window until it's
@@ -101,6 +104,7 @@ pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
         }
     };
 
+    let mut cursors = cursor::Cursors::new();
     let mut decoded = Vec::new();
     let mut shown: Option<decode::Decoded> = None;
     let mut ticker = Ticker::new(Duration::from_secs(1));
@@ -123,6 +127,12 @@ pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
         if let Some(reason) = session.conn.close_reason() {
             println!("disconnected: {reason}");
             break;
+        }
+        while let Ok(m) = session.cursor.try_recv() {
+            if let (false, Some(c)) = (view_only, cursors.handle(m)) {
+                CURSOR.with(|cur| cur.set(Some(c)));
+                cursor::apply_now(hwnd, c);
+            }
         }
         if let Some((w, h)) = SINK.with(|s| s.borrow_mut().as_mut().and_then(|s| s.resized.take())) {
             renderer.resize(w, h)?;
@@ -400,6 +410,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => match CURSOR.with(|c| c.get()) {
+                Some(c) => {
+                    SetCursor(c);
+                    LRESULT(1)
+                }
+                None => DefWindowProcW(hwnd, msg, wp, lp),
+            },
             // Keep Alt / F10 from opening the (nonexistent) window menu.
             WM_SYSCOMMAND if (wp.0 & 0xFFF0) == SC_KEYMENU as usize => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wp, lp),

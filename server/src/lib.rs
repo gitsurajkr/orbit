@@ -2,6 +2,7 @@
 //! Used by the `orbit-server` CLI and by the ORBIT app's SHARE mode.
 
 pub mod capture;
+pub mod cursor;
 pub mod input;
 pub mod net;
 pub mod nvenc;

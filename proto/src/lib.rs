@@ -3,7 +3,7 @@
 //!
 //! Transport (set up by the binaries): one QUIC connection over Tailscale.
 //! - Reliable bidirectional stream opened by the client: [`ctrl::Ctrl`] messages
-//!   (hello, keyframe requests, keys, mouse buttons, wheel, ping/pong).
+//!   (hello, keyframe requests, keys, mouse buttons, wheel, ping/pong, pointer shapes).
 //! - Unreliable datagrams: video fragments (server → client, [`video`]) and mouse moves
 //!   (client → server, [`ctrl::MouseMove`]). A late or lost datagram is never retransmitted,
 //!   so nothing old can ever queue up in front of something new.
@@ -15,7 +15,7 @@ pub mod tailscale;
 pub mod video;
 
 /// Bumped whenever any byte layout in this crate changes.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 /// QUIC ALPN, so an ORBIT client can't talk to something else by accident.
 pub const ALPN: &[u8] = b"orbit/1";
 /// Default UDP port.

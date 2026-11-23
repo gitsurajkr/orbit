@@ -1,7 +1,7 @@
 //! Client networking (tokio): connect, handshake, then three tasks:
 //! - datagrams: reassemble video frames, gate deltas after a loss, request keyframes
 //! - ctrl writer: keys/buttons/wheel/keyframe requests from the window, plus clock pings
-//! - ctrl reader: pongs → clock sync
+//! - ctrl reader: pongs → clock sync, pointer shapes → window thread
 //!
 //! Complete frames go to the window thread through a channel, and a Win32 event wakes it up
 //! immediately (no polling interval).
@@ -51,6 +51,8 @@ pub struct Session {
     pub stats: Arc<NetStats>,
     /// Set by the window thread when decoding failed: the gate then waits for a keyframe.
     pub decoder_failed: Arc<AtomicBool>,
+    /// Pointer shape messages ([`Ctrl::Cursor`], [`Ctrl::CursorImage`]) for the window thread.
+    pub cursor: mpsc::Receiver<Ctrl>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -126,7 +128,7 @@ async fn read_ctrl(r: &mut RecvStream) -> Result<Ctrl> {
     Ctrl::decode(tag, &body)
 }
 
-async fn write_ctrl(w: &mut SendStream, c: Ctrl) -> Result<()> {
+async fn write_ctrl(w: &mut SendStream, c: &Ctrl) -> Result<()> {
     let mut buf = Vec::with_capacity(32);
     c.encode(&mut buf);
     w.write_all(&buf).await?;
@@ -141,7 +143,7 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
         .await
         .with_context(|| format!("no answer from {server} (is ORBIT sharing on that PC and reachable over Tailscale?)"))??;
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_ctrl(&mut send, Ctrl::ClientHello { version: proto::VERSION }).await?;
+    write_ctrl(&mut send, &Ctrl::ClientHello { version: proto::VERSION }).await?;
     let (width, height, fps) = match tokio::time::timeout(Duration::from_secs(5), read_ctrl(&mut recv)).await.context("no hello from server")?? {
         Ctrl::ServerHello { version, width, height, fps } => {
             ensure!(version == proto::VERSION, "server protocol {version}, client {}", proto::VERSION);
@@ -163,19 +165,27 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
                 m = ctrl_rx.recv() => match m { Some(m) => m, None => break },
                 _ = ping.tick() => Ctrl::Ping { client_us: now_us() },
             };
-            if write_ctrl(&mut send, msg).await.is_err() {
+            if write_ctrl(&mut send, &msg).await.is_err() {
                 break;
             }
         }
     });
 
-    // ctrl reader: pongs
+    // ctrl reader: pongs, pointer shapes
+    let (cursor_tx, cursor_rx) = mpsc::channel::<Ctrl>();
     {
         let clock = clock.clone();
         tokio::spawn(async move {
             while let Ok(m) = read_ctrl(&mut recv).await {
-                if let Ctrl::Pong { client_us, server_us } = m {
-                    clock.lock().unwrap().add(client_us, server_us, now_us());
+                match m {
+                    Ctrl::Pong { client_us, server_us } => clock.lock().unwrap().add(client_us, server_us, now_us()),
+                    m @ (Ctrl::Cursor { .. } | Ctrl::CursorImage { .. }) => {
+                        if cursor_tx.send(m).is_err() {
+                            break;
+                        }
+                        wake.signal();
+                    }
+                    _ => {}
                 }
             }
         });
@@ -235,5 +245,5 @@ pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: W
         });
     }
 
-    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, width, height, fps })
+    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, width, height, fps })
 }

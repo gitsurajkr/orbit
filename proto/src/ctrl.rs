@@ -6,7 +6,7 @@ use anyhow::{bail, ensure, Result};
 
 pub const HEADER_LEN: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ctrl {
     /// C→S, first message.
     ClientHello { version: u16 },
@@ -24,6 +24,52 @@ pub enum Ctrl {
     Ping { client_us: u64 },
     /// S→C, clock sync: echo plus server's clock when received.
     Pong { client_us: u64, server_us: u64 },
+    /// S→C: the remote pointer's shape changed. `kind` is [`cursor::HIDDEN`], a standard shape
+    /// (index into [`cursor::STANDARD`] + 1) or [`cursor::CUSTOM`] with `key` naming an image
+    /// sent earlier in a [`Ctrl::CursorImage`].
+    Cursor { kind: u8, key: u32 },
+    /// S→C: an app-defined pointer image, sent once per distinct image before the first
+    /// [`Ctrl::Cursor`] that uses it. `key` is a hash of the pixels; `bgra` is top-down,
+    /// straight (not premultiplied) alpha, `width * height * 4` bytes.
+    CursorImage { key: u32, hot_x: u16, hot_y: u16, width: u16, height: u16, bgra: Vec<u8> },
+}
+
+/// Pointer shapes, shared by both sides.
+pub mod cursor {
+    pub const HIDDEN: u8 = 0;
+    pub const CUSTOM: u8 = 255;
+    /// Largest custom pointer sent (a bigger one shows as the arrow). 96×96×4 bytes keeps a
+    /// [`super::Ctrl::CursorImage`] under the 64 KiB message limit.
+    pub const MAX_SIZE: u16 = 96;
+    /// Windows' standard cursors (`IDC_*` resource ids), in wire order: kind = index + 1.
+    pub const STANDARD: [u16; 16] = [
+        32512, // IDC_ARROW
+        32513, // IDC_IBEAM
+        32514, // IDC_WAIT
+        32515, // IDC_CROSS
+        32516, // IDC_UPARROW
+        32642, // IDC_SIZENWSE
+        32643, // IDC_SIZENESW
+        32644, // IDC_SIZEWE
+        32645, // IDC_SIZENS
+        32646, // IDC_SIZEALL
+        32648, // IDC_NO
+        32649, // IDC_HAND
+        32650, // IDC_APPSTARTING
+        32651, // IDC_HELP
+        32671, // IDC_PIN
+        32672, // IDC_PERSON
+    ];
+
+    /// FNV-1a over the image, its size and hotspot: the cache key for a custom pointer.
+    pub fn image_key(width: u16, height: u16, hot_x: u16, hot_y: u16, bgra: &[u8]) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in [width, height, hot_x, hot_y].iter().flat_map(|v| v.to_le_bytes()).chain(bgra.iter().copied()) {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
+    }
 }
 
 mod tag {
@@ -35,6 +81,8 @@ mod tag {
     pub const WHEEL: u8 = 6;
     pub const PING: u8 = 7;
     pub const PONG: u8 = 8;
+    pub const CURSOR: u8 = 9;
+    pub const CURSOR_IMAGE: u8 = 10;
 }
 
 impl Ctrl {
@@ -43,6 +91,19 @@ impl Ctrl {
         let start = out.len();
         out.extend_from_slice(&[0, 0, 0]);
         let t = match *self {
+            Ctrl::Cursor { kind, key } => {
+                out.push(kind);
+                out.extend_from_slice(&key.to_le_bytes());
+                tag::CURSOR
+            }
+            Ctrl::CursorImage { key, hot_x, hot_y, width, height, ref bgra } => {
+                out.extend_from_slice(&key.to_le_bytes());
+                for v in [hot_x, hot_y, width, height] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out.extend_from_slice(bgra);
+                tag::CURSOR_IMAGE
+            }
             Ctrl::ClientHello { version } => {
                 out.extend_from_slice(&version.to_le_bytes());
                 tag::CLIENT_HELLO
@@ -127,6 +188,18 @@ impl Ctrl {
                 need(16)?;
                 Ctrl::Pong { client_us: u64_at(0), server_us: u64_at(8) }
             }
+            tag::CURSOR => {
+                need(5)?;
+                Ctrl::Cursor { kind: b[0], key: u32::from_le_bytes(b[1..5].try_into().unwrap()) }
+            }
+            tag::CURSOR_IMAGE => {
+                need(12)?;
+                let (width, height) = (u16_at(8), u16_at(10));
+                ensure!(width <= cursor::MAX_SIZE && height <= cursor::MAX_SIZE, "cursor {width}x{height} too big");
+                let len = width as usize * height as usize * 4;
+                need(12 + len)?;
+                Ctrl::CursorImage { key: u32::from_le_bytes(b[0..4].try_into().unwrap()), hot_x: u16_at(4), hot_y: u16_at(6), width, height, bgra: b[12..12 + len].to_vec() }
+            }
             t => bail!("unknown ctrl tag {t}"),
         })
     }
@@ -180,6 +253,9 @@ mod tests {
             Ctrl::Wheel { delta: -240, horizontal: true },
             Ctrl::Ping { client_us: u64::MAX - 1 },
             Ctrl::Pong { client_us: 7, server_us: 1 << 40 },
+            Ctrl::Cursor { kind: cursor::CUSTOM, key: 0xdead_beef },
+            Ctrl::CursorImage { key: 1, hot_x: 3, hot_y: 4, width: 2, height: 1, bgra: vec![1, 2, 3, 4, 5, 6, 7, 8] },
+            Ctrl::CursorImage { key: 2, hot_x: 0, hot_y: 0, width: 96, height: 96, bgra: vec![9; 96 * 96 * 4] },
         ];
         let mut buf = Vec::new();
         for m in &all {
@@ -189,7 +265,7 @@ mod tests {
         for m in &all {
             let (t, len) = Ctrl::parse_header(rest[..HEADER_LEN].try_into().unwrap());
             let body = &rest[HEADER_LEN..HEADER_LEN + len];
-            assert_eq!(Ctrl::decode(t, body).unwrap(), *m);
+            assert_eq!(&Ctrl::decode(t, body).unwrap(), m);
             rest = &rest[HEADER_LEN + len..];
         }
         assert!(rest.is_empty());
@@ -199,6 +275,17 @@ mod tests {
     fn short_body_is_an_error_not_a_panic() {
         assert!(Ctrl::decode(tag::PONG, &[0; 15]).is_err());
         assert!(Ctrl::decode(99, &[]).is_err());
+        // image shorter than width*height*4, or bigger than the limit
+        assert!(Ctrl::decode(tag::CURSOR_IMAGE, &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 1]).is_err());
+        assert!(Ctrl::decode(tag::CURSOR_IMAGE, &[0, 0, 0, 0, 0, 0, 0, 0, 200, 0, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn image_key_depends_on_pixels_and_hotspot() {
+        let a = cursor::image_key(1, 1, 0, 0, &[1, 2, 3, 4]);
+        assert_eq!(a, cursor::image_key(1, 1, 0, 0, &[1, 2, 3, 4]));
+        assert_ne!(a, cursor::image_key(1, 1, 0, 0, &[1, 2, 3, 5]));
+        assert_ne!(a, cursor::image_key(1, 1, 1, 0, &[1, 2, 3, 4]));
     }
 
     #[test]

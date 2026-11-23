@@ -7,6 +7,7 @@
 //!                       ▲ force_idr (AtomicBool)
 //! client ───► ctrl stream task: hello, keyframe requests, keys, buttons, wheel, ping→pong
 //! client ───► datagram task: mouse moves → SendInput
+//! client ◄─── ctrl writer task ◄── pongs, pointer shape changes (cursor task, every 16 ms)
 //! ```
 
 use crate::capture::MonitorInfo;
@@ -222,8 +223,8 @@ async fn read_ctrl(r: &mut RecvStream) -> Result<Ctrl> {
     Ctrl::decode(tag, &body)
 }
 
-async fn write_ctrl(w: &mut SendStream, c: Ctrl) -> Result<()> {
-    let mut buf = Vec::with_capacity(32);
+async fn write_ctrl(w: &mut SendStream, c: &Ctrl) -> Result<()> {
+    let mut buf = Vec::with_capacity(64);
     c.encode(&mut buf);
     w.write_all(&buf).await?;
     Ok(())
@@ -235,7 +236,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         Ctrl::ClientHello { version } => ensure!(version == proto::VERSION, "client protocol {version}, server {}", proto::VERSION),
         other => bail!("expected hello, got {other:?}"),
     }
-    write_ctrl(&mut send, Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
+    write_ctrl(&mut send, &Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
     let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
     let video = {
@@ -243,12 +244,33 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
     };
     let input = Input::new(s.monitor.clone());
+    // Everything sent on the control stream goes through this channel to one writer.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Ctrl>();
 
+    let writer = async {
+        while let Some(m) = out_rx.recv().await {
+            write_ctrl(&mut send, &m).await?;
+        }
+        Ok(())
+    };
+    let cursor = async {
+        let mut watch = crate::cursor::CursorWatch::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(16));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut msgs = Vec::new();
+        loop {
+            tick.tick().await;
+            watch.poll(&mut msgs);
+            for m in msgs.drain(..) {
+                out_tx.send(m)?;
+            }
+        }
+    };
     let ctrl = async {
         loop {
             match read_ctrl(&mut recv).await? {
                 Ctrl::KeyframeRequest => shared.force_idr.store(true, Ordering::Release),
-                Ctrl::Ping { client_us } => write_ctrl(&mut send, Ctrl::Pong { client_us, server_us: now_us() }).await?,
+                Ctrl::Ping { client_us } => out_tx.send(Ctrl::Pong { client_us, server_us: now_us() })?,
                 c @ (Ctrl::Key { .. } | Ctrl::MouseButton { .. } | Ctrl::Wheel { .. }) => input.handle(c),
                 other => bail!("unexpected {other:?}"),
             }
@@ -267,6 +289,8 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
     let result: Result<()> = tokio::select! {
         r = ctrl => r,
         r = dgrams => r,
+        r = writer => r,
+        r = cursor => r,
     };
     stop.store(true, Ordering::Release);
     let _ = tokio::task::spawn_blocking(move || video.join()).await;

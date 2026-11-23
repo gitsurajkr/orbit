@@ -28,7 +28,7 @@
 - [ ] Clipboard sync.
 - [ ] Multi-monitor switching from the viewer.
 - [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).
-- [ ] Show the remote cursor shape (I-beam, resize arrows).
+- [x] Show the remote cursor shape (standard shapes by id, app pointers as images; protocol v3).
 - [x] FEC: Reed-Solomon parity per frame, 10–40 % following loss (protocol v2).
 - [ ] NVENC reference-frame invalidation, so a frame FEC can't save costs no keyframe either.
 - [x] Tray icon (left click opens, right click menu, status tooltip; ─ and ✕ go to the tray).
