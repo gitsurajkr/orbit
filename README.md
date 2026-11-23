@@ -74,7 +74,8 @@ The remote screen opens in its own window. To end the session, close that window
 
 | In the viewer | |
 |---|---|
-| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Enter</kbd> | Toggle fullscreen |
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Enter</kbd> | Toggle fullscreen (stays on this PC) |
+| <kbd>Win</kbd>, <kbd>Alt</kbd>+<kbd>Tab</kbd>, <kbd>Ctrl</kbd>+<kbd>Esc</kbd> | Go to the remote PC while the viewer has focus |
 | Title bar | Live fps, bitrate and latency |
 | **VIEW ONLY** (CONNECT tab) | Watch without controlling |
 
@@ -146,7 +147,7 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 
 - One monitor at a time. No clipboard sync yet.
 - The remote cursor shape isn't shown; your own pointer is used (which is also why it feels instant).
-- <kbd>Win</kbd>, <kbd>Alt</kbd>+<kbd>Tab</kbd> and <kbd>Ctrl</kbd>+<kbd>Esc</kbd> are handled by the viewing PC, not forwarded.
+- <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
 - The sharing PC must stay **unlocked**: the lock screen and UAC prompts can't be captured by a normal app. ORBIT waits and resumes on unlock.
 - To control apps running as administrator, run ORBIT as administrator on the sharing PC.
 - On hybrid laptops used for sharing, frames are copied from the integrated GPU to the NVIDIA GPU (a few ms extra).
@@ -157,7 +158,7 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 - [ ] Lower resolution automatically on very slow links
 - [ ] Pairing with a PIN and certificate pinning
 - [ ] Clipboard sync and multi-monitor switching
-- [ ] Remote cursor shape, and forwarding <kbd>Win</kbd> / <kbd>Alt</kbd>+<kbd>Tab</kbd>
+- [ ] Remote cursor shape
 - [ ] Lock screen and UAC capture (Windows service)
 
 ## Build from source

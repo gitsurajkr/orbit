@@ -1,6 +1,6 @@
 //! The viewer window: connects, decodes, presents, forwards input.
 
-use crate::{decode, net, render};
+use crate::{decode, keyhook, net, render};
 use anyhow::{Context, Result};
 use proto::clock::now_us;
 use proto::ctrl::{Ctrl, MouseMove};
@@ -87,6 +87,19 @@ pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
             fullscreen: None,
         })
     });
+
+    // Win / Alt+Tab / Ctrl+Esc go to the remote PC while this window has focus.
+    let _hook = if view_only {
+        None
+    } else {
+        match keyhook::KeyHook::install(hwnd, forward_key) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("note: can't forward Win / Alt+Tab ({e}); they stay on this PC");
+                None
+            }
+        }
+    };
 
     let mut decoded = Vec::new();
     let mut shown: Option<decode::Decoded> = None;
@@ -180,6 +193,17 @@ pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
     }
     session.conn.close(0u32.into(), b"bye");
     Ok(())
+}
+
+/// A key the keyboard hook took away from Windows: send it like any other key.
+fn forward_key(scan: u16, extended: bool, down: bool) {
+    SINK.with(|cell| {
+        if let Ok(mut s) = cell.try_borrow_mut() {
+            if let Some(s) = s.as_mut() {
+                s.key(scan, extended, down);
+            }
+        }
+    });
 }
 
 fn client_size(hwnd: HWND) -> (u32, u32) {
@@ -350,6 +374,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
             }
             WM_KILLFOCUS => {
+                keyhook::KeyHook::focus_lost();
                 s.release_all();
                 return false;
             }

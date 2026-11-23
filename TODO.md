@@ -27,7 +27,7 @@
 - [ ] Pairing / auth (milestone 5): PIN on first connect, verify the server certificate.
 - [ ] Clipboard sync.
 - [ ] Multi-monitor switching from the viewer.
-- [ ] Forward Win key / Alt+Tab (low-level keyboard hook in the viewer).
+- [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).
 - [ ] Show the remote cursor shape (I-beam, resize arrows).
 - [x] FEC: Reed-Solomon parity per frame, 10–40 % following loss (protocol v2).
 - [ ] NVENC reference-frame invalidation, so a frame FEC can't save costs no keyframe either.
