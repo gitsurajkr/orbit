@@ -36,6 +36,8 @@ struct InputSink {
     resized: Option<(u32, u32)>,
     view_only: bool,
     fullscreen: Option<(WINDOW_STYLE, RECT)>,
+    /// Sends files dropped on the window to the sharing PC.
+    drops: Option<xfer::DropSender>,
 }
 
 thread_local! {
@@ -88,8 +90,13 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
             resized: None,
             view_only,
             fullscreen: None,
+            drops: session.sync.as_ref().map(|s| s.drop_files()),
         })
     });
+    if !view_only {
+        // Files dragged onto the window go to the sharing PC's Downloads\ORBIT.
+        unsafe { windows::Win32::UI::Shell::DragAcceptFiles(hwnd, true) };
+    }
 
     // Win / Alt+Tab / Ctrl+Esc go to the remote PC while this window has focus.
     let _hook = if view_only {
@@ -195,7 +202,11 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
             );
             println!("{line}");
             unsafe {
-                let _ = SetWindowTextW(hwnd, &HSTRING::from(format!("ORBIT — {}", &line[..line.find(" | decode").unwrap_or(line.len())])));
+                let transfer = session.sync.as_ref().and_then(|s| s.progress()).map(|t| format!(" | {t}")).unwrap_or_default();
+                if !transfer.is_empty() {
+                    println!("{}", &transfer[3..]);
+                }
+                let _ = SetWindowTextW(hwnd, &HSTRING::from(format!("ORBIT — {}{transfer}", &line[..line.find(" | decode").unwrap_or(line.len())])));
             }
             prev = now;
             presented = 0;
@@ -203,6 +214,21 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
     }
     session.conn.close(0u32.into(), b"bye");
     Ok(())
+}
+
+/// The files in a WM_DROPFILES message (and releases it).
+unsafe fn dropped_paths(h: windows::Win32::UI::Shell::HDROP) -> Vec<std::path::PathBuf> {
+    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW};
+    let n = DragQueryFileW(h, u32::MAX, None);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let len = DragQueryFileW(h, i, None) as usize;
+        let mut buf = vec![0u16; len + 1];
+        DragQueryFileW(h, i, Some(&mut buf));
+        out.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len])));
+    }
+    DragFinish(h);
+    out
 }
 
 /// A key the keyboard hook took away from Windows: send it like any other key.
@@ -381,6 +407,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     if scan != 0 {
                         s.key(scan, extended, down);
                     }
+                }
+            }
+            WM_DROPFILES => {
+                let paths = unsafe { dropped_paths(windows::Win32::UI::Shell::HDROP(wp.0 as _)) };
+                match &s.drops {
+                    Some(d) if !paths.is_empty() => d.send(paths),
+                    _ => {}
                 }
             }
             WM_KILLFOCUS => {

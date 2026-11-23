@@ -80,6 +80,13 @@ The remote screen opens in its own window. To end the session, close that window
 | **VIEW ONLY** (CONNECT tab) | Watch without controlling |
 | **SYNC CLIPBOARD** (CONNECT tab) | Copy text or an image on one PC, paste it on the other (on by default) |
 
+### Sending files
+
+- **Drag** files or folders onto the viewer window: they're saved in **Downloads\ORBIT** on the other PC, and Explorer opens there with them selected.
+- **Copy** files in Explorer (<kbd>Ctrl</kbd>+<kbd>C</kbd>) on either PC, then paste (<kbd>Ctrl</kbd>+<kbd>V</kbd>) on the other once they've arrived (needs SYNC CLIPBOARD; copies over 4 GB: drag them instead).
+- Progress shows in the viewer's title bar and the SHARE tab. Video keeps priority: transfers only use bandwidth the stream leaves free, and slow down as soon as the link gets busy.
+- Files arrive as `name.part` and get their real name when complete; a name that's taken becomes `name (1)`.
+
 > [!TIP]
 > Run `tailscale status` and look at the other PC's line. `direct` means the best latency. `relay "bom"` (or another city) means traffic goes through a Tailscale relay, which adds tens of milliseconds. Being on the same Wi-Fi or having IPv6 on both networks usually gives a direct path.
 

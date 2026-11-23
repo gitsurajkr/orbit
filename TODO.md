@@ -26,6 +26,7 @@
 - [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).
 - [x] Pairing / auth (milestone 5): ID certificates, paired-device list, own-account auto-pair, 6-digit code (SPAKE2), known-PC check.
 - [x] Clipboard sync: text and images both ways (xfer crate, one QUIC stream per item).
+- [x] Send files: drag onto the viewer, or copy/paste in Explorer; paced to leave the video room.
 - [ ] Multi-monitor switching from the viewer.
 - [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).
 - [x] Show the remote cursor shape (standard shapes by id, app pointers as images; protocol v3).

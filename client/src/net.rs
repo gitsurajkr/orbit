@@ -53,8 +53,8 @@ pub struct Session {
     pub decoder_failed: Arc<AtomicBool>,
     /// Pointer shape messages ([`Ctrl::Cursor`], [`Ctrl::CursorImage`]) for the window thread.
     pub cursor: mpsc::Receiver<Ctrl>,
-    /// Clipboard sync for this session (None if it couldn't start).
-    pub _sync: Option<xfer::Sync>,
+    /// Clipboard sync and file transfer for this session (None if it couldn't start).
+    pub sync: Option<xfer::Sync>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -353,5 +353,5 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
     }
 
     let sync = xfer::start(conn.clone(), opts.clipboard).map_err(|e| eprintln!("clipboard sync unavailable: {e:#}")).ok();
-    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, _sync: sync, width, height, fps })
+    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, sync, width, height, fps })
 }

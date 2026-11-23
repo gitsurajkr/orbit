@@ -759,6 +759,9 @@ impl App {
                 if let Some(s) = &st.stats {
                     ui.label(RichText::new(s).font(FontId::monospace(10.5)).color(gray(170)));
                 }
+                if let Some(t) = &st.transfer {
+                    widgets::status_line(ui, t, true);
+                }
                 if let Some(e) = &st.error {
                     widgets::notice(ui, &e.to_uppercase());
                 }

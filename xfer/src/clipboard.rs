@@ -19,7 +19,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::*;
-use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Largest text copied (bytes of UTF-8).
@@ -30,6 +31,8 @@ pub enum Clip {
     Text(String),
     /// A PNG file's bytes.
     Png(Vec<u8>),
+    /// Files / folders copied in Explorer (full paths on this PC).
+    Files(Vec<std::path::PathBuf>),
 }
 
 impl Clip {
@@ -226,9 +229,22 @@ fn png_format() -> u32 {
     unsafe { RegisterClipboardFormatW(w!("PNG")) }
 }
 
-/// Text if there is any, else an image (PNG as provided by the app, or converted), else None.
+/// Files if Explorer copied some, else text, else an image (PNG as provided by the app, or
+/// converted), else None.
 unsafe fn read(hwnd: HWND) -> Result<Option<Clip>> {
     let _open = Open::new(hwnd)?;
+    if IsClipboardFormatAvailable(CF_HDROP.0 as u32).is_ok() {
+        let h = HDROP(GetClipboardData(CF_HDROP.0 as u32)?.0);
+        let n = DragQueryFileW(h, u32::MAX, None);
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let len = DragQueryFileW(h, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            DragQueryFileW(h, i, Some(&mut buf));
+            paths.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len])));
+        }
+        return Ok((!paths.is_empty()).then_some(Clip::Files(paths)));
+    }
     if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok() {
         let h = GetClipboardData(CF_UNICODETEXT.0 as u32)?;
         let Some(b) = global_bytes(h) else { return Ok(None) };
@@ -278,7 +294,7 @@ unsafe fn write(hwnd: HWND, c: &Clip) -> Result<()> {
     // Decode before taking the clipboard, so it's held only briefly.
     let dib = match c {
         Clip::Png(b) => Some(image::rgba_to_dib(&image::decode_png(b)?)),
-        Clip::Text(_) => None,
+        _ => None,
     };
     let _open = Open::new(hwnd)?;
     EmptyClipboard()?;
@@ -291,6 +307,20 @@ unsafe fn write(hwnd: HWND, c: &Clip) -> Result<()> {
         Clip::Png(b) => {
             put(png_format(), b)?; // keeps transparency for apps that read PNG
             put(CF_DIB.0 as u32, dib.as_deref().unwrap_or_default())?;
+        }
+        Clip::Files(paths) => {
+            // DROPFILES header (file list at offset 20, wide chars), then NUL-separated paths
+            // ending in an extra NUL: what Explorer pastes.
+            let mut b = Vec::new();
+            for v in [20u32, 0, 0, 0, 1] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            for p in paths {
+                b.extend(p.as_os_str().to_string_lossy().encode_utf16().chain([0]).flat_map(|u| u.to_le_bytes()));
+            }
+            b.extend_from_slice(&[0, 0]);
+            put(CF_HDROP.0 as u32, &b)?;
+            put(RegisterClipboardFormatW(w!("Preferred DropEffect")), &1u32.to_le_bytes())?; // copy, not move
         }
     }
     Ok(())

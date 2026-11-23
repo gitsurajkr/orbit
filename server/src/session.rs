@@ -62,6 +62,8 @@ pub struct StatusInfo {
     pub client_name: Option<String>,
     /// Latest once-a-second stats line.
     pub stats: Option<String>,
+    /// File transfer in progress, e.g. "RECEIVING clip.mp4 45% · 12.3 MB/s".
+    pub transfer: Option<String>,
     /// Latest problem (cleared when things work again).
     pub error: Option<String>,
 }
@@ -321,7 +323,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
     println!("let in: {name} ({})", conn.remote_address());
     status.update(|i| i.client_name = Some(name.clone()));
     // Clipboard sync, if the viewer asked for it; runs until this function returns.
-    let _sync = xfer::start(conn.clone(), flags & proto::ctrl::hello::CLIPBOARD != 0)
+    let sync = xfer::start(conn.clone(), flags & proto::ctrl::hello::CLIPBOARD != 0)
         .map_err(|e| eprintln!("clipboard sync unavailable: {e:#}"))
         .ok();
     write_ctrl(&mut send, &Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
@@ -354,11 +356,17 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
             }
         }
     };
-    // Removing the device from the list on this PC ends its session too.
+    // Removing the device from the list on this PC ends its session too. Also reports file
+    // transfers for the UI.
     let still_trusted = async {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tick.tick().await;
+            let t = sync.as_ref().and_then(|s| s.progress());
+            if let Some(t) = &t {
+                println!("{t}");
+            }
+            shared.status.update(|i| i.transfer = t);
             if s.gate.trusted(&fp).is_none() {
                 bail!("{name} was removed from the paired devices");
             }
