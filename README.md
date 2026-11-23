@@ -70,6 +70,10 @@ flowchart LR
 2. **On the PC you want to control:** open ORBIT → **SHARE** → press the big button. It shows this PC's Tailscale IP (click to copy).
 3. **On the other PC:** open ORBIT → **CONNECT** → type that IP or Tailscale name → press the big button or <kbd>Enter</kbd>.
 
+Your Tailscale devices that are online show up as buttons under the address, so you can click instead of typing an IP. If Tailscale isn't installed or signed in, ORBIT says so and offers a button to fix it; if a connection fails, it says why (not shared with you, offline, or not sharing).
+
+**Connecting to a friend's PC** (someone on another Tailscale account): on his PC, SHARE → **INVITE A FRIEND** walks through it: share the PC in Tailscale, copy a ready-made message with the download links, and show a pairing code. Only needed once.
+
 The remote screen opens in its own window. To end the session, close that window, or press **DISCONNECT** in ORBIT.
 
 | In the viewer | |

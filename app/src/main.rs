@@ -86,8 +86,14 @@ fn main() {
         return;
     }
     server::dpi_aware();
-    let Some(_instance) = autostart::single_instance() else {
-        return; // already running: brought the existing window forward
+    // ORBIT_SECOND_INSTANCE=1: a test copy next to the installed one (development only).
+    let _instance = if std::env::var_os("ORBIT_SECOND_INSTANCE").is_some() {
+        None
+    } else {
+        match autostart::single_instance() {
+            Some(i) => Some(i),
+            None => return, // already running: brought the existing window forward
+        }
     };
     let launched_at_login = args.iter().any(|a| a == "--autostart");
     if let Err(e) = ui::run(launched_at_login) {

@@ -80,6 +80,98 @@ pub fn same_account(ip: IpAddr) -> Option<bool> {
     parse_same_account(&status_json()?, ip)
 }
 
+/// What the local Tailscale says, for the app's hints and device list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// tailscale.exe was found.
+    pub installed: bool,
+    /// "Running", "NeedsLogin", "Stopped", "Starting", ... (empty if not installed).
+    pub state: String,
+    /// Where to sign in, when Tailscale asks for it.
+    pub auth_url: String,
+    /// This PC's Tailscale machine name (as in Tailscale's admin page).
+    pub self_name: String,
+    pub peers: Vec<Peer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    /// Machine name, e.g. "workstation".
+    pub name: String,
+    pub ip: String,
+    pub os: String,
+    pub online: bool,
+    /// Shared with this account from someone else's Tailscale.
+    pub shared_in: bool,
+}
+
+impl Snapshot {
+    pub fn running(&self) -> bool {
+        self.state == "Running"
+    }
+
+    pub fn peer(&self, ip: IpAddr) -> Option<&Peer> {
+        let ip = ip.to_canonical().to_string();
+        self.peers.iter().find(|p| p.ip == ip)
+    }
+}
+
+/// "workstation.tail7bd7fb.ts.net." -> "workstation" (falls back to the host name).
+fn machine_name(v: &serde_json::Value) -> String {
+    let dns = v.get("DNSName").and_then(|x| x.as_str()).unwrap_or("");
+    match dns.split('.').next() {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => v.get("HostName").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+    }
+}
+
+pub fn parse_snapshot(json: &str) -> Snapshot {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Snapshot { installed: true, ..Default::default() };
+    };
+    let str_of = |x: Option<&serde_json::Value>| x.and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut peers: Vec<Peer> = v
+        .get("Peer")
+        .and_then(|p| p.as_object())
+        .map(|m| {
+            m.values()
+                .filter_map(|p| {
+                    let ip = p.get("TailscaleIPs")?.as_array()?.iter().filter_map(|x| x.as_str()).find(|x| x.contains('.'))?.to_string();
+                    Some(Peer {
+                        name: machine_name(p),
+                        ip,
+                        os: str_of(p.get("OS")),
+                        online: p.get("Online").and_then(|x| x.as_bool()).unwrap_or(false),
+                        shared_in: p.get("ShareeNode").and_then(|x| x.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    peers.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
+    Snapshot {
+        installed: true,
+        state: str_of(v.get("BackendState")),
+        auth_url: str_of(v.get("AuthURL")),
+        self_name: v.get("Self").map(machine_name).unwrap_or_default(),
+        peers,
+    }
+}
+
+/// The local Tailscale's state (runs the CLI, ~50 ms: call it off the UI thread).
+pub fn snapshot() -> Snapshot {
+    match status_json() {
+        Some(j) => parse_snapshot(&j),
+        // The CLI exits with an error when the service is stopped: installed but not running.
+        None if tailscale_exe().exists() => Snapshot { installed: true, state: "Stopped".into(), ..Default::default() },
+        None => Snapshot::default(),
+    }
+}
+
+fn tailscale_exe() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe")
+}
+
 /// Runs `tailscale status --json` (no console window) and returns its output.
 fn status_json() -> Option<String> {
     let installed = std::path::Path::new(r"C:\Program Files\Tailscale\tailscale.exe");
@@ -176,6 +268,22 @@ mod tests {
         assert_eq!(parse_path(&status("", "bom", "", false), ip), None);
         assert_eq!(parse_path(&status("", "bom", "", true), "100.2.2.2".parse().unwrap()), None);
         assert_eq!(parse_path("not json", ip), None);
+    }
+
+    #[test]
+    fn snapshot_lists_peers_by_machine_name() {
+        let j = r#"{"BackendState":"Running","AuthURL":"","Self":{"DNSName":"omen.tail.ts.net.","HostName":"DESKTOP-1"},"Peer":{
+            "a":{"DNSName":"workstation.tail.ts.net.","HostName":"DESKTOP0312","TailscaleIPs":["100.90.182.75","fd7a::1"],"OS":"windows","Online":true},
+            "b":{"DNSName":"","HostName":"pi","TailscaleIPs":["fd7a::2","100.1.2.3"],"OS":"linux","Online":false,"ShareeNode":true}}}"#;
+        let s = parse_snapshot(j);
+        assert!(s.running() && s.installed);
+        assert_eq!(s.self_name, "omen");
+        assert_eq!(s.peers.len(), 2);
+        assert_eq!((s.peers[0].name.as_str(), s.peers[0].ip.as_str(), s.peers[0].online), ("workstation", "100.90.182.75", true), "online first");
+        assert_eq!((s.peers[1].name.as_str(), s.peers[1].ip.as_str(), s.peers[1].shared_in), ("pi", "100.1.2.3", true), "falls back to the host name");
+        assert_eq!(s.peer("100.90.182.75".parse().unwrap()).map(|p| p.name.as_str()), Some("workstation"));
+        let login = parse_snapshot(r#"{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/xyz"}"#);
+        assert!(!login.running() && login.auth_url.ends_with("xyz"));
     }
 
     #[test]

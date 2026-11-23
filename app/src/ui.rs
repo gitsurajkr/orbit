@@ -60,6 +60,10 @@ struct App {
     gate: Arc<auth::Gate>,
     /// The PAIRED DEVICES box is open.
     devices_open: bool,
+    /// The INVITE A FRIEND box is open.
+    invite_open: bool,
+    /// What the local Tailscale says (installed, signed in, devices), refreshed every 3 s.
+    ts: Arc<Mutex<proto::tailscale::Snapshot>>,
     /// "Always on" sharing by the ORBIT Service (works on the lock screen).
     always: crate::always_on::AlwaysOn,
     /// A device whose REMOVE was clicked once (click again to confirm).
@@ -115,6 +119,8 @@ impl App {
             identity: auth::Identity::load_or_create().map_err(|e| format!("{e:#}")),
             gate: auth::Gate::load(),
             devices_open: false,
+            invite_open: false,
+            ts: watch_tailscale(&cc.egui_ctx),
             always: crate::always_on::AlwaysOn::start(&cc.egui_ctx),
             removing: None,
             server: None,
@@ -234,7 +240,83 @@ impl App {
             _ => None,
         };
         if self.prompt.is_none() {
-            self.connect_error = Some(msg);
+            self.connect_error = Some(if msg.contains("no answer") { self.why_no_answer().unwrap_or(msg) } else { msg });
+        }
+    }
+
+    /// A connection got no answer: say why, from what Tailscale knows about that address.
+    fn why_no_answer(&self) -> Option<String> {
+        let ts = self.ts.lock().unwrap().clone();
+        let addr = self.viewer_addr.trim();
+        let host = addr.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(addr, |(h, _)| h);
+        if !ts.installed {
+            return Some("TAILSCALE ISN'T INSTALLED ON THIS PC: ORBIT REACHES OTHER PCS THROUGH IT".into());
+        }
+        if !ts.running() {
+            return Some("TAILSCALE ISN'T RUNNING ON THIS PC: START IT (OR SIGN IN) AND TRY AGAIN".into());
+        }
+        let peer = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => ts.peer(ip),
+            Err(_) => ts.peers.iter().find(|p| p.name.eq_ignore_ascii_case(host.split('.').next().unwrap_or(host))),
+        };
+        Some(match peer {
+            None => format!("THIS PC CAN'T SEE {host} ON TAILSCALE. IF IT'S A FRIEND'S PC, HE HAS TO SHARE IT WITH YOU FIRST (ON HIS PC: SHARE > INVITE A FRIEND)"),
+            Some(p) if !p.online => format!("{} IS OFFLINE IN TAILSCALE: TURNED OFF, ASLEEP OR WITHOUT INTERNET", p.name.to_uppercase()),
+            Some(p) => format!("{} IS ONLINE, BUT ORBIT ISN'T SHARING THERE: PRESS SHARE ON THAT PC", p.name.to_uppercase()),
+        })
+    }
+
+    /// INVITE A FRIEND: the three steps to let someone on another Tailscale account connect.
+    fn invite_dialog(&mut self, ctx: &egui::Context) {
+        let ts = self.ts.lock().unwrap().clone();
+        let me = if ts.self_name.is_empty() { "THIS PC".to_string() } else { ts.self_name.to_uppercase() };
+        let ip = self.tailscale_ip.clone().unwrap_or_else(|| "(THIS PC'S TAILSCALE IP)".into());
+        let (mut close, mut copy, mut pair) = (false, false, false);
+        let step = |ui: &mut egui::Ui, n: &str, text: &str| {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(n).font(FontId::monospace(16.0)).color(W));
+                ui.label(RichText::new(text).font(FontId::monospace(11.0)).color(gray(190)));
+            });
+        };
+        let outside = modal(ctx, "invite", |ui| {
+            ui.label(RichText::new("INVITE A FRIEND").font(FontId::monospace(20.0)).color(W));
+            ui.add_space(4.0);
+            ui.label(RichText::new("FOR SOMEONE ON ANOTHER TAILSCALE ACCOUNT (ONCE)").font(FontId::monospace(10.5)).color(gray(120)));
+            ui.add_space(14.0);
+            step(ui, "1", &format!("SHARE THIS PC WITH HIM IN TAILSCALE:\nCLICK ⋯ NEXT TO {me} > SHARE > HIS EMAIL"));
+            ui.add_space(6.0);
+            if widgets::button(ui, "OPEN TAILSCALE SHARING", true).clicked() {
+                open_url("https://login.tailscale.com/admin/machines");
+            }
+            ui.add_space(14.0);
+            step(ui, "2", "HE INSTALLS TAILSCALE + ORBIT AND\nACCEPTS YOUR SHARE EMAIL");
+            ui.add_space(6.0);
+            copy = widgets::button(ui, "COPY A MESSAGE FOR HIM", false).clicked();
+            ui.add_space(14.0);
+            step(ui, "3", &format!("HE CONNECTS TO {ip}\nAND TYPES THE CODE YOU GIVE HIM"));
+            ui.add_space(6.0);
+            pair = widgets::button(ui, "SHOW A CODE", false).clicked();
+            ui.add_space(16.0);
+            close = widgets::button(ui, "CLOSE", false).clicked();
+        });
+        if copy {
+            let msg = format!(
+                "Let's connect with ORBIT:\n1. Install Tailscale: https://tailscale.com/download/windows\n2. Install ORBIT: https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe\n3. Accept the Tailscale share email I sent you\n4. In ORBIT > CONNECT type {ip}, then the code I give you"
+            );
+            ctx.output_mut(|o| o.copied_text = msg);
+            self.copied_at = Some(Instant::now());
+        }
+        if pair {
+            self.invite_open = false;
+            self.devices_open = true;
+            if self.always.running() {
+                self.always.command(serde_json::json!({"cmd": "pin_start"}));
+            } else {
+                self.gate.start_pin();
+            }
+        }
+        if close || outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.invite_open = false;
         }
     }
 
@@ -632,6 +714,9 @@ impl eframe::App for App {
         if self.devices_open {
             self.devices_dialog(ctx);
         }
+        if self.invite_open {
+            self.invite_dialog(ctx);
+        }
         if self.prompt.is_some() && self.viewer.is_none() {
             self.prompt_dialog(ctx);
         }
@@ -670,12 +755,31 @@ impl App {
         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         ui.add_space(14.0);
 
+        let ts = self.ts.lock().unwrap().clone();
+        if !tailscale_hint(ui, &ts) {
+            // Online devices on your tailnet: click instead of typing an IP.
+            let online: Vec<_> = ts.peers.iter().filter(|p| p.online).take(6).cloned().collect();
+            if !online.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    ui.label(RichText::new("ONLINE").font(FontId::monospace(10.5)).color(gray(110)));
+                    for p in online {
+                        if widgets::chip(ui, &p.name.to_uppercase()).on_hover_text(format!("{} · {}", p.ip, p.os)).clicked() && !busy {
+                            self.addr = p.ip.clone();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        }
         if !self.cfg.recent.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
                 ui.label(RichText::new("RECENT").font(FontId::monospace(10.5)).color(gray(110)));
                 for a in self.cfg.recent.clone() {
-                    if widgets::chip(ui, &a).clicked() && !busy {
+                    // Show the Tailscale name when the address is a known device.
+                    let name = a.parse::<std::net::IpAddr>().ok().and_then(|ip| ts.peer(ip)).map(|p| p.name.to_uppercase());
+                    if widgets::chip(ui, name.as_deref().unwrap_or(&a)).on_hover_text(&a).clicked() && !busy {
                         self.addr = a;
                     }
                 }
@@ -739,7 +843,12 @@ impl App {
                     self.copied_at = Some(Instant::now());
                 }
             }
-            None => widgets::notice(ui, "TAILSCALE ISN'T RUNNING ON THIS PC"),
+            None => {
+                let ts = self.ts.lock().unwrap().clone();
+                if !tailscale_hint(ui, &ts) {
+                    widgets::notice(ui, "TAILSCALE ISN'T CONNECTED YET");
+                }
+            }
         }
         ui.add_space(14.0);
 
@@ -791,9 +900,15 @@ impl App {
             None => (self.gate.devices().len(), self.gate.pin().is_some()),
         };
         let pairing = if pin_showing { " · CODE SHOWING" } else { "" };
-        if widgets::chip(ui, &format!("PAIRED DEVICES · {n}{pairing}  >")).clicked() {
-            self.devices_open = true;
-        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+            if widgets::chip(ui, &format!("PAIRED DEVICES · {n}{pairing}  >")).clicked() {
+                self.devices_open = true;
+            }
+            if widgets::chip(ui, "INVITE A FRIEND  >").clicked() {
+                self.invite_open = true;
+            }
+        });
 
         if always {
             if let Some(s) = self.server.take() {
@@ -1158,5 +1273,60 @@ fn ago(unix: u64) -> String {
         0 => "TODAY".into(),
         1 => "YESTERDAY".into(),
         d => format!("{d} DAYS AGO"),
+    }
+}
+
+/// Refreshes the Tailscale snapshot every 3 s on a background thread (the CLI takes ~50 ms).
+fn watch_tailscale(ctx: &egui::Context) -> Arc<Mutex<proto::tailscale::Snapshot>> {
+    let snap: Arc<Mutex<proto::tailscale::Snapshot>> = Arc::default();
+    let (s, ctx) = (snap.clone(), ctx.clone());
+    let _ = std::thread::Builder::new().name("tailscale".into()).spawn(move || loop {
+        let new = proto::tailscale::snapshot();
+        if *s.lock().unwrap() != new {
+            *s.lock().unwrap() = new;
+            ctx.request_repaint();
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    snap
+}
+
+/// Tailscale missing or signed out: says so with a button to fix it. Returns true if shown.
+fn tailscale_hint(ui: &mut egui::Ui, ts: &proto::tailscale::Snapshot) -> bool {
+    if ts.running() {
+        return false;
+    }
+    let (text, button) = if !ts.installed {
+        ("ORBIT CONNECTS PCS THROUGH TAILSCALE, WHICH ISN'T INSTALLED HERE", "INSTALL TAILSCALE")
+    } else if ts.state.is_empty() {
+        return false; // not read yet
+    } else if !ts.auth_url.is_empty() || ts.state == "NeedsLogin" {
+        ("TAILSCALE ISN'T SIGNED IN ON THIS PC", "SIGN IN TO TAILSCALE")
+    } else {
+        ("TAILSCALE IS INSTALLED BUT NOT RUNNING", "OPEN TAILSCALE")
+    };
+    widgets::notice(ui, text);
+    ui.add_space(4.0);
+    if widgets::button(ui, button, true).clicked() {
+        if !ts.installed {
+            open_url("https://tailscale.com/download/windows");
+        } else if !ts.auth_url.is_empty() {
+            open_url(&ts.auth_url);
+        } else {
+            // The Tailscale tray app: starts it, or shows its sign-in.
+            let _ = std::process::Command::new(r"C:\Program Files\Tailscale\tailscale-ipn.exe").spawn();
+        }
+    }
+    ui.add_space(8.0);
+    true
+}
+
+/// Opens a web page in the default browser.
+fn open_url(url: &str) {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }
 }
