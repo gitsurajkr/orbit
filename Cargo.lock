@@ -120,7 +120,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "auth",
@@ -167,7 +167,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "getrandom 0.2.17",
@@ -395,7 +395,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
 name = "client"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "auth",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "reed-solomon-simd",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "auth",
@@ -3394,7 +3394,7 @@ checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 
 [[package]]
 name = "xfer"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "png 0.17.16",
