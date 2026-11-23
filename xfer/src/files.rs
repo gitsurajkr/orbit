@@ -82,10 +82,16 @@ impl Progress {
     }
 }
 
-/// Paces a transfer so it only uses bandwidth the video leaves free ("scavenger" traffic):
-/// starts slow, speeds up 25% every 250 ms while the link is clean, holds on a little loss
-/// (Wi-Fi drops the odd packet), and halves on real congestion: over 2% of packets lost, or
-/// video waiting in the datagram queue.
+/// Paces a transfer so it only uses bandwidth the video leaves free ("scavenger" traffic).
+///
+/// Every 250 ms it looks at the link and decides ([`Step`]): speed up 25%, hold, or halve.
+/// Trouble shows up three ways, and any of them means "back off":
+/// - **queueing delay**: home routers usually don't drop packets when the upload is full, they
+///   queue them, and everything else on the link (mouse, keys, the acks the video needs) waits
+///   in that queue. So the round-trip time is compared with the lowest one seen recently (the
+///   empty-line baseline): more than [`QUEUE_LIMIT`] above it is a queue building up;
+/// - **loss** over 2% of packets (the odd lost packet on Wi-Fi only stops the speed-up);
+/// - **video waiting** in our own datagram queue.
 struct Pacer {
     rate: f64, // bytes per second
     max: f64,
@@ -94,6 +100,36 @@ struct Pacer {
     lost: u64,
     sent: u64,
     max_free: usize,
+    /// Lowest RTT seen: the baseline (refreshed every [`BASE_WINDOW`], so a route that got
+    /// slower doesn't read as a queue forever).
+    base_rtt: std::time::Duration,
+    window_min: std::time::Duration,
+    window_start: Instant,
+}
+
+/// Queueing delay above the baseline that counts as a queue building up.
+const QUEUE_LIMIT: std::time::Duration = std::time::Duration::from_millis(20);
+/// Half of that: no speeding up beyond it.
+const QUEUE_HOLD: std::time::Duration = std::time::Duration::from_millis(10);
+const BASE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Faster,
+    Hold,
+    Slower,
+}
+
+/// What the pacer does after one look at the link.
+fn step(video_waiting: bool, lost: u64, sent: u64, rtt: std::time::Duration, base_rtt: std::time::Duration) -> Step {
+    let queue = rtt.saturating_sub(base_rtt);
+    if video_waiting || lost * 50 > sent.max(1) || queue > QUEUE_LIMIT {
+        Step::Slower
+    } else if lost > 0 || queue > QUEUE_HOLD {
+        Step::Hold
+    } else {
+        Step::Faster
+    }
 }
 
 impl Pacer {
@@ -103,7 +139,19 @@ impl Pacer {
     fn new(conn: &Connection) -> Pacer {
         let max = rate_cap().map_or(f64::INFINITY, |m| m * 1e6);
         let st = conn.stats();
-        Pacer { rate: Self::START.min(max), max, next: Instant::now(), checked: Instant::now(), lost: st.path.lost_packets, sent: st.path.sent_packets, max_free: conn.datagram_send_buffer_space() }
+        let now = Instant::now();
+        Pacer {
+            rate: Self::START.min(max),
+            max,
+            next: now,
+            checked: now,
+            lost: st.path.lost_packets,
+            sent: st.path.sent_packets,
+            max_free: conn.datagram_send_buffer_space(),
+            base_rtt: conn.rtt(),
+            window_min: conn.rtt(),
+            window_start: now,
+        }
     }
 
     /// Call before sending `n` bytes: waits as long as the current rate requires.
@@ -114,11 +162,18 @@ impl Pacer {
         let video_waiting = free + VIDEO_BACKLOG < self.max_free;
         if video_waiting || now - self.checked >= std::time::Duration::from_millis(250) {
             let st = conn.stats();
+            let rtt = conn.rtt();
+            self.base_rtt = self.base_rtt.min(rtt);
+            self.window_min = self.window_min.min(rtt);
+            if now - self.window_start >= BASE_WINDOW {
+                self.base_rtt = self.window_min;
+                (self.window_min, self.window_start) = (rtt, now);
+            }
             let (lost, sent) = (st.path.lost_packets - self.lost, st.path.sent_packets - self.sent);
-            if video_waiting || lost * 50 > sent.max(1) {
-                self.rate = (self.rate * 0.5).max(Self::MIN);
-            } else if lost == 0 {
-                self.rate = (self.rate * 1.25).min(self.max);
+            match step(video_waiting, lost, sent, rtt, self.base_rtt) {
+                Step::Slower => self.rate = (self.rate * 0.5).max(Self::MIN),
+                Step::Faster => self.rate = (self.rate * 1.25).min(self.max),
+                Step::Hold => {}
             }
             (self.lost, self.sent) = (st.path.lost_packets, st.path.sent_packets);
             self.checked = now;
@@ -419,6 +474,18 @@ pub type SharedProgress = Arc<Progress>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacer_backs_off_on_queues_loss_and_waiting_video() {
+        let ms = std::time::Duration::from_millis;
+        let base = ms(50);
+        assert_eq!(step(false, 0, 1000, ms(52), base), Step::Faster, "clean link");
+        assert_eq!(step(false, 0, 1000, ms(65), base), Step::Hold, "a small queue: stop speeding up");
+        assert_eq!(step(false, 0, 1000, ms(75), base), Step::Slower, "router queue building up");
+        assert_eq!(step(false, 3, 1000, ms(50), base), Step::Hold, "the odd Wi-Fi loss");
+        assert_eq!(step(false, 30, 1000, ms(50), base), Step::Slower, "real loss");
+        assert_eq!(step(true, 0, 1000, ms(50), base), Step::Slower, "video waiting");
+    }
 
     #[test]
     fn cleans_paths() {
