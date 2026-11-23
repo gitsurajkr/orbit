@@ -160,6 +160,9 @@ impl App {
         if self.cfg.view_only {
             cmd.arg("--view-only");
         }
+        if !self.cfg.clipboard {
+            cmd.arg("--no-clipboard");
+        }
         if let Some(c) = &code {
             cmd.arg("--code").arg(c);
         }
@@ -648,6 +651,12 @@ impl App {
         let mut vo = self.cfg.view_only;
         if widgets::check(ui, &mut vo, "VIEW ONLY  (watch, don't control)") {
             self.cfg.view_only = vo;
+            self.cfg.save();
+        }
+        ui.add_space(2.0);
+        let mut clip = self.cfg.clipboard;
+        if widgets::check(ui, &mut clip, "SYNC CLIPBOARD  (copy here, paste there)") {
+            self.cfg.clipboard = clip;
             self.cfg.save();
         }
         ui.add_space(4.0);

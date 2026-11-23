@@ -15,11 +15,14 @@ struct Args {
     /// Connect even though the server's ID changed since last time (e.g. ORBIT was reinstalled).
     #[arg(long)]
     accept_new_identity: bool,
+    /// Don't sync the clipboard with the server.
+    #[arg(long)]
+    no_clipboard: bool,
 }
 
 fn main() {
     let args = Args::parse();
-    let opts = client::ConnectOptions { code: args.code, accept_new_identity: args.accept_new_identity };
+    let opts = client::ConnectOptions { code: args.code, accept_new_identity: args.accept_new_identity, clipboard: !args.no_clipboard && !args.view_only };
     if let Err(e) = client::run_viewer(&args.server, args.view_only, &opts) {
         eprintln!("orbit-client: {e:#}");
         std::process::exit(1);

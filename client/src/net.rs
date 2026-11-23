@@ -53,6 +53,8 @@ pub struct Session {
     pub decoder_failed: Arc<AtomicBool>,
     /// Pointer shape messages ([`Ctrl::Cursor`], [`Ctrl::CursorImage`]) for the window thread.
     pub cursor: mpsc::Receiver<Ctrl>,
+    /// Clipboard sync for this session (None if it couldn't start).
+    pub _sync: Option<xfer::Sync>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -96,6 +98,8 @@ impl std::error::Error for AuthError {}
 pub struct ConnectOptions {
     pub code: Option<String>,
     pub accept_new_identity: bool,
+    /// Sync the clipboard both ways.
+    pub clipboard: bool,
 }
 
 /// Accepts any server certificate *during* the handshake (TLS still checks the server holds
@@ -220,7 +224,8 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
     }
 
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_ctrl(&mut send, &Ctrl::ClientHello { version: proto::VERSION, name: auth::device_name() }).await?;
+    let flags = if opts.clipboard { proto::ctrl::hello::CLIPBOARD } else { 0 };
+    write_ctrl(&mut send, &Ctrl::ClientHello { version: proto::VERSION, flags, name: auth::device_name() }).await?;
     let hello = async {
         let mut paired = false;
         loop {
@@ -347,5 +352,6 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
         });
     }
 
-    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, width, height, fps })
+    let sync = xfer::start(conn.clone(), opts.clipboard).map_err(|e| eprintln!("clipboard sync unavailable: {e:#}")).ok();
+    Ok(Session { conn, ctrl: ctrl_tx, clock, stats, decoder_failed, cursor: cursor_rx, _sync: sync, width, height, fps })
 }

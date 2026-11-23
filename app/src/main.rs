@@ -35,6 +35,7 @@ fn main() {
         let opts = client::ConnectOptions {
             code: args.iter().position(|a| a == "--code").and_then(|i| args.get(i + 1)).cloned(),
             accept_new_identity: args.iter().any(|a| a == "--accept-new-identity"),
+            clipboard: !view_only && !args.iter().any(|a| a == "--no-clipboard"),
         };
         if let Err(e) = client::run_viewer(addr, view_only, &opts) {
             eprintln!("{e:#}");

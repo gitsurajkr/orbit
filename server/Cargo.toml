@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 proto.workspace = true
 auth = { path = "../auth" }
+xfer = { path = "../xfer" }
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }

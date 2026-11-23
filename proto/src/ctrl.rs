@@ -8,8 +8,9 @@ pub const HEADER_LEN: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ctrl {
-    /// C→S, first message. `name` is the viewer PC's name, for the sharing PC's device list.
-    ClientHello { version: u16, name: String },
+    /// C→S, first message. `flags`: [`hello::CLIPBOARD`]. `name` is the viewer PC's name, for
+    /// the sharing PC's device list.
+    ClientHello { version: u16, flags: u8, name: String },
     /// S→C, reply to hello: the captured monitor's size and the capture rate cap.
     ServerHello { version: u16, width: u16, height: u16, fps: u16 },
     /// S→C, instead of [`Ctrl::ServerHello`]: this viewer isn't on the sharing PC's device list.
@@ -45,6 +46,12 @@ pub enum Ctrl {
     /// [`Ctrl::Cursor`] that uses it. `key` is a hash of the pixels; `bgra` is top-down,
     /// straight (not premultiplied) alpha, `width * height * 4` bytes.
     CursorImage { key: u32, hot_x: u16, hot_y: u16, width: u16, height: u16, bgra: Vec<u8> },
+}
+
+/// [`Ctrl::ClientHello`] flags.
+pub mod hello {
+    /// The viewer wants clipboard sync (both ways).
+    pub const CLIPBOARD: u8 = 1;
 }
 
 /// Pointer shapes, shared by both sides.
@@ -133,8 +140,9 @@ impl Ctrl {
                 out.extend_from_slice(bgra);
                 tag::CURSOR_IMAGE
             }
-            Ctrl::ClientHello { version, ref name } => {
+            Ctrl::ClientHello { version, flags, ref name } => {
                 out.extend_from_slice(&version.to_le_bytes());
+                out.push(flags);
                 put_text(out, name);
                 tag::CLIENT_HELLO
             }
@@ -211,9 +219,11 @@ impl Ctrl {
         Ok(match tag {
             tag::CLIENT_HELLO => {
                 need(2)?;
-                // v2 clients send only the version; the name is then empty (and the version
+                // v2 clients send only the version; the rest is then empty (and the version
                 // check refuses them anyway).
-                Ctrl::ClientHello { version: u16_at(0), name: String::from_utf8_lossy(&b[2..b.len().min(2 + MAX_TEXT)]).into_owned() }
+                let flags = b.get(2).copied().unwrap_or(0);
+                let name = b.get(3..).map(|n| String::from_utf8_lossy(&n[..n.len().min(MAX_TEXT)]).into_owned()).unwrap_or_default();
+                Ctrl::ClientHello { version: u16_at(0), flags, name }
             }
             tag::PAIR_REQUIRED => {
                 need(1)?;
@@ -305,8 +315,8 @@ mod tests {
     #[test]
     fn every_message_round_trips() {
         let all = [
-            Ctrl::ClientHello { version: 1, name: "LAPTOP-NOVA".into() },
-            Ctrl::ClientHello { version: 1, name: String::new() },
+            Ctrl::ClientHello { version: 1, flags: hello::CLIPBOARD, name: "LAPTOP-NOVA".into() },
+            Ctrl::ClientHello { version: 1, flags: 0, name: String::new() },
             Ctrl::PairRequired { code_active: true },
             Ctrl::PairStart { msg: vec![1, 2, 3] },
             Ctrl::PairReply { msg: vec![4; 33] },

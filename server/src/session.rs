@@ -310,16 +310,20 @@ async fn admit(conn: &Connection, send: &mut SendStream, recv: &mut RecvStream, 
 
 async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: Arc<Status>) -> Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await.context("no control stream")??;
-    let name = match read_ctrl(&mut recv).await? {
-        Ctrl::ClientHello { version, name } => {
+    let (name, flags) = match read_ctrl(&mut recv).await? {
+        Ctrl::ClientHello { version, flags, name } => {
             ensure!(version == proto::VERSION, "client protocol {version}, server {}: update ORBIT on both PCs", proto::VERSION);
-            name
+            (name, flags)
         }
         other => bail!("expected hello, got {other:?}"),
     };
     let (name, fp) = tokio::time::timeout(Duration::from_secs(20), admit(&conn, &mut send, &mut recv, &s, name)).await.context("pairing took too long")??;
     println!("let in: {name} ({})", conn.remote_address());
     status.update(|i| i.client_name = Some(name.clone()));
+    // Clipboard sync, if the viewer asked for it; runs until this function returns.
+    let _sync = xfer::start(conn.clone(), flags & proto::ctrl::hello::CLIPBOARD != 0)
+        .map_err(|e| eprintln!("clipboard sync unavailable: {e:#}"))
+        .ok();
     write_ctrl(&mut send, &Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
     let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });

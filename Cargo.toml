@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "auth", "server", "client", "app"]
+members = ["proto", "auth", "xfer", "server", "client", "app"]
 
 [workspace.package]
 version = "0.1.9"

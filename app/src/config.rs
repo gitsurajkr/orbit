@@ -11,13 +11,15 @@ pub struct Config {
     pub share_tab: bool,
     /// Start with Windows and share automatically.
     pub autostart: bool,
+    /// Sync the clipboard while connected.
+    pub clipboard: bool,
 }
 
 pub const FPS_OPTIONS: [u32; 4] = [30, 60, 120, 144];
 
 impl Default for Config {
     fn default() -> Self {
-        Config { recent: Vec::new(), view_only: false, fps_index: 1, mbps: 20.0, share_tab: false, autostart: false }
+        Config { recent: Vec::new(), view_only: false, fps_index: 1, mbps: 20.0, share_tab: false, autostart: false, clipboard: true }
     }
 }
 
@@ -38,6 +40,7 @@ impl Config {
                 "mbps" => c.mbps = v.trim().parse().unwrap_or(20.0f32).clamp(2.0, 100.0),
                 "share_tab" => c.share_tab = v.trim() == "1",
                 "autostart" => c.autostart = v.trim() == "1",
+                "clipboard" => c.clipboard = v.trim() != "0",
                 _ => {}
             }
         }
@@ -50,13 +53,14 @@ impl Config {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "recent={}\nview_only={}\nfps_index={}\nmbps={}\nshare_tab={}\nautostart={}\n",
+            "recent={}\nview_only={}\nfps_index={}\nmbps={}\nshare_tab={}\nautostart={}\nclipboard={}\n",
             self.recent.join(","),
             self.view_only as u8,
             self.fps_index,
             self.mbps,
             self.share_tab as u8,
-            self.autostart as u8
+            self.autostart as u8,
+            self.clipboard as u8
         );
         let _ = std::fs::write(p, text);
     }
