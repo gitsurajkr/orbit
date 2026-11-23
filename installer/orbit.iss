@@ -53,6 +53,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; address, so this doesn't expose it on the local network.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; StatusMsg: "Configuring Windows Firewall..."
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#AppName}"" dir=in action=allow program=""{app}\{#AppExe}"" protocol=UDP profile=any enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall..."
+; The ORBIT Service: sharing through it includes the lock screen and UAC prompts. Also
+; copies this user's ORBIT ID and paired devices to it, and keeps its settings on updates.
+Filename: "{app}\{#AppExe}"; Parameters: "--install-service"; Flags: runhidden waituntilterminated; StatusMsg: "Setting up the ORBIT service..."
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 ; In-app updates run the installer silently: start the new version afterwards, as the normal user.
 Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
@@ -63,8 +66,8 @@ Filename: "{app}\{#AppExe}"; Parameters: "--uninstall-service"; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
 
 [Code]
-// "Always on" sharing runs orbit.exe as a Windows service, which keeps the file in use: stop
-// it before replacing the files, and start it again afterwards (in-app updates included).
+// The ORBIT Service keeps orbit.exe in use: stop it before replacing the files ([Run] sets it
+// up and starts it again afterwards, in-app updates included).
 var
   ServiceWasInstalled: Boolean;
 
@@ -92,12 +95,4 @@ begin
     end;
   end;
   Result := '';
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  Code: Integer;
-begin
-  if (CurStep = ssPostInstall) and ServiceWasInstalled then
-    Exec(ExpandConstant('{sys}\sc.exe'), 'start ORBIT', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;

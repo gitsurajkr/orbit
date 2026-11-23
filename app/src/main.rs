@@ -53,12 +53,15 @@ fn main() {
     }
     if flag("--install-service") || flag("--uninstall-service") {
         let num = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
-        let settings = service::AgentSettings {
-            fps: num("--fps").map_or(60, |v| v as u32),
+        // Without --fps etc. (the installer), the agent keeps its settings across updates.
+        let settings = num("--fps").map(|fps| service::AgentSettings {
+            fps: fps as u32,
             mbps: num("--mbps").map_or(20.0, |v| v as f32),
             monitor: num("--monitor").map_or(0, |v| v as usize),
-        };
-        let r = if flag("--install-service") { service::install(&settings) } else { service::uninstall() };
+            sharing: false,
+            share_at_boot: false,
+        });
+        let r = if flag("--install-service") { service::install(settings.as_ref()) } else { service::uninstall() };
         if let Err(e) = r {
             eprintln!("{e:#}");
             std::process::exit(1);

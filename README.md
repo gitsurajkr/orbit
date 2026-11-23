@@ -99,16 +99,15 @@ ORBIT sits in the **notification area** next to the clock:
 - **Hover** to see what it's doing, e.g. `ORBIT · SHARING · 100.x.y.z CONNECTED`.
 - The window's **─** and **✕** buttons send ORBIT to the tray, so sharing keeps running. Quit from the tray menu.
 
-### Start ORBIT when Windows starts (lock screen included)
+### Lock screen, UAC prompts and Ctrl+Alt+Del
 
-On the sharing PC, tick **START ORBIT WHEN WINDOWS STARTS** in the SHARE tab and allow Windows' admin prompt once. ORBIT then shares through a small Windows service (*ORBIT Remote Desktop*) that:
+The installer sets up a small Windows service (*ORBIT Remote Desktop*), and sharing always goes through it. So whenever you share, the other PC also sees and controls the **lock screen, sign-in screen and UAC prompts**, and can press **Ctrl+Alt+Del** (viewer window menu: <kbd>Alt</kbd>+<kbd>Space</kbd> → *Send Ctrl+Alt+Del*). Nothing to set up.
 
-- starts with Windows, **before anyone signs in**, so you can sign in remotely after a restart;
-- shows and controls the **lock screen, sign-in screen and UAC prompts**;
-- can press **Ctrl+Alt+Del** (viewer window menu: <kbd>Alt</kbd>+<kbd>Space</kbd> → *Send Ctrl+Alt+Del*);
-- keeps your paired devices and this PC's ID (they're copied to it, and back when you turn it off).
+The portable `orbit.exe` (not installed) has no service: it shares everything except those.
 
-Untick it to remove the service. If you decline the admin prompt, ORBIT falls back to starting at sign-in (no lock screen).
+### Start ORBIT when Windows starts
+
+Tick **START ORBIT WHEN WINDOWS STARTS** in the SHARE tab. After every restart, sharing comes back by itself, **before anyone signs in**, so you can sign in remotely; ORBIT also opens in the tray when you sign in. Unticked, nothing is shared after a restart until you press SHARE.
 
 For restarts with nobody at the PC, also set **Tailscale before sign-in**: Tailscale tray icon → Preferences → **Run unattended**, and set sleep to **Never** (Settings → System → Power; turning the screen off is fine).
 
@@ -167,7 +166,7 @@ How a device gets on the list, once:
 - One remote screen at a time (switch with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>1</kbd>…<kbd>9</kbd>).
 - Your own pointer stands in for the remote one (which is why it feels instant); it takes the remote pointer's shape: I-beam, resize arrows, hand, hidden during video.
 - <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Del</kbd> stays on the viewing PC (Windows reserves it).
-- Without **START ORBIT WHEN WINDOWS STARTS**, the lock screen and UAC prompts can't be captured (Windows reserves them for services); ORBIT waits and resumes on unlock.
+- The portable `orbit.exe` can't capture the lock screen or UAC prompts (Windows reserves them for services); it waits and resumes on unlock. The installed ORBIT can.
 - To control apps running as administrator, run ORBIT as administrator on the sharing PC.
 - On hybrid laptops used for sharing, frames are copied from the integrated GPU to the NVIDIA GPU (a few ms extra).
 

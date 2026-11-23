@@ -13,6 +13,12 @@
 //! The service itself never touches the screen or the network: it only (re)starts the agent
 //! when it exits or another session takes the screen (sign-out, user switch).
 //!
+//! The installer sets the service up, so every share includes the lock screen. The agent only
+//! listens while sharing is on (SHARE / STOP in the app, over the pipe). After a restart,
+//! sharing comes back on only if "start ORBIT when Windows starts" is ticked: when Windows
+//! shuts down, the service sets `sharing` to `share_at_boot`. (A plain service stop, e.g.
+//! during an update, keeps sharing as it was.)
+//!
 //! The agent keeps its ID certificate, paired devices and settings in `C:\ProgramData\ORBIT`,
 //! which only SYSTEM and administrators may open.
 
@@ -45,11 +51,15 @@ pub fn log_dir() -> PathBuf {
 /// Registers and starts the service (needs administrator rights). `settings` become the
 /// agent's; this user's ID certificate and paired devices are copied to it, so paired PCs
 /// keep connecting without a warning or a new code.
-pub fn install(settings: &AgentSettings) -> Result<()> {
+pub fn install(settings: Option<&AgentSettings>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
-    save_agent_settings(settings)?;
+    match settings {
+        Some(s) => save_agent_settings(s)?,
+        None if !dir.join("agent.cfg").exists() => save_agent_settings(&load_agent_settings())?, // defaults
+        None => {} // keep the settings across updates
+    }
     if auth::Identity::load_from(&dir).is_err() {
         if let Ok(mine) = auth::Identity::load_or_create() {
             mine.save_in(&dir, true)?;
@@ -168,7 +178,15 @@ fn service_main(_args: Vec<OsString>) {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let handler = move |c| match c {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
+        ServiceControl::Shutdown => {
+            // Windows is shutting down or restarting: share after it only if asked to.
+            let mut cfg = load_agent_settings();
+            cfg.sharing = cfg.share_at_boot;
+            let _ = save_agent_settings(&cfg);
+            s.store(true, Ordering::Release);
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Stop => {
             s.store(true, Ordering::Release);
             ServiceControlHandlerResult::NoError
         }
@@ -312,22 +330,35 @@ pub struct AgentSettings {
     pub fps: u32,
     pub mbps: f32,
     pub monitor: usize,
+    /// Sharing right now (SHARE / STOP).
+    pub sharing: bool,
+    /// Share again after Windows restarts ("start ORBIT when Windows starts").
+    pub share_at_boot: bool,
 }
 
 pub fn save_agent_settings(s: &AgentSettings) -> Result<()> {
     std::fs::create_dir_all(data_dir())?;
-    std::fs::write(data_dir().join("agent.cfg"), format!("fps={}\nmbps={}\nmonitor={}\n", s.fps, s.mbps, s.monitor))?;
+    std::fs::write(
+        data_dir().join("agent.cfg"),
+        format!("fps={}\nmbps={}\nmonitor={}\nsharing={}\nshare_at_boot={}\n", s.fps, s.mbps, s.monitor, s.sharing as u8, s.share_at_boot as u8),
+    )?;
     Ok(())
 }
 
 pub fn load_agent_settings() -> AgentSettings {
-    let mut s = AgentSettings { fps: 60, mbps: 20.0, monitor: 0 };
+    let mut s = AgentSettings { fps: 60, mbps: 20.0, monitor: 0, sharing: false, share_at_boot: false };
     if let Ok(t) = std::fs::read_to_string(data_dir().join("agent.cfg")) {
+        // v0.3.0's service always shared (it was the "start with Windows" switch): keep that.
+        if !t.contains("sharing=") {
+            (s.sharing, s.share_at_boot) = (true, true);
+        }
         for line in t.lines() {
             match line.split_once('=') {
                 Some(("fps", v)) => s.fps = v.trim().parse().unwrap_or(60),
                 Some(("mbps", v)) => s.mbps = v.trim().parse().unwrap_or(20.0),
                 Some(("monitor", v)) => s.monitor = v.trim().parse().unwrap_or(0),
+                Some(("sharing", v)) => s.sharing = v.trim() == "1",
+                Some(("share_at_boot", v)) => s.share_at_boot = v.trim() == "1",
                 _ => {}
             }
         }
@@ -393,6 +424,15 @@ pub fn run_agent() -> Result<()> {
     loop {
         let cfg = load_agent_settings();
         restart.store(false, Ordering::Release);
+        if !cfg.sharing {
+            // Not sharing: nothing listens. Wait for SHARE (or a settings change).
+            println!("not sharing (press SHARE in ORBIT)");
+            current.lock().unwrap().take();
+            while !restart.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            continue;
+        }
         let start = || -> Result<server::ServerHandle> {
             let monitor = server::preflight(cfg.monitor)?;
             let settings = server::Settings { monitor, fps: cfg.fps, bitrate_bps: (cfg.mbps * 1e6) as u32, identity: identity.clone(), gate: gate.clone() };
@@ -421,7 +461,12 @@ pub fn run_agent() -> Result<()> {
             }
             Err(e) => {
                 println!("can't share yet: {e:#}; retrying in 5 s");
-                std::thread::sleep(Duration::from_secs(5));
+                for _ in 0..20 {
+                    if restart.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             }
         }
     }
@@ -443,6 +488,7 @@ fn agent_request(req: &serde_json::Value, gate: &auth::Gate, current: &std::sync
                 "client": st.client, "client_name": st.client_name, "stats": st.stats, "transfer": st.transfer, "error": st.error.map(|e| format!("{e}")),
                 "devices": devices, "trust_own": gate.trust_own_account(), "pin": pin,
                 "fps": cfg.fps, "mbps": cfg.mbps, "monitor": cfg.monitor,
+                "sharing": cfg.sharing, "share_at_boot": cfg.share_at_boot,
                 "desktop": server::desktop::input_desktop_name(),
             })
         }
@@ -472,6 +518,12 @@ fn agent_request(req: &serde_json::Value, gate: &auth::Gate, current: &std::sync
             }
             if let Some(v) = req.get("monitor").and_then(|v| v.as_u64()) {
                 cfg.monitor = v as usize;
+            }
+            if let Some(v) = req.get("sharing").and_then(|v| v.as_bool()) {
+                cfg.sharing = v;
+            }
+            if let Some(v) = req.get("share_at_boot").and_then(|v| v.as_bool()) {
+                cfg.share_at_boot = v;
             }
             match save_agent_settings(&cfg) {
                 Ok(()) => {

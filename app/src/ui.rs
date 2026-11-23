@@ -447,10 +447,10 @@ impl App {
     fn tray_tip(&self) -> String {
         if self.viewer.is_some() {
             format!("ORBIT · CONNECTED TO {}", self.viewer_addr)
-        } else if self.always.running() {
-            match self.always.status().and_then(|v| v["client_name"].as_str().map(String::from)) {
-                Some(n) => format!("ORBIT · ALWAYS ON · {n} CONNECTED"),
-                None => "ORBIT · ALWAYS ON · WAITING".into(),
+        } else if let Some(v) = self.always.status().filter(|v| v["sharing"].as_bool() == Some(true)) {
+            match v["client_name"].as_str() {
+                Some(n) => format!("ORBIT · SHARING · {n} CONNECTED"),
+                None => "ORBIT · SHARING · WAITING".into(),
             }
         } else if let Some(s) = &self.server {
             let st = s.status.get();
@@ -566,7 +566,6 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         // Auto-share: keep trying (Tailscale and the network can take a while after boot).
-        self.always.poll();
         if self.always.running() {
             self.auto_share_at = None; // the service shares this PC
         }
@@ -774,50 +773,17 @@ impl App {
             }
         }
 
-        // One switch for "share without me pressing SHARE". Done by the ORBIT Service, which
-        // starts before sign-in and also shares the lock screen and UAC prompts (Windows asks for
-        // admin permission once). If that permission is declined: the old way, sharing starts
-        // when this user signs in.
-        let busy = self.always.busy();
-        let mut on = match busy {
-            Some(target) => target,
-            None => always || self.cfg.autostart,
-        };
-        if widgets::check(ui, &mut on, "START ORBIT WHEN WINDOWS STARTS") && busy.is_none() {
-            if on {
-                if let Some(s) = self.server.take() {
-                    s.stop(); // the service takes over the port
-                }
-                let settings = crate::service::AgentSettings { fps: FPS_OPTIONS[self.cfg.fps_index], mbps: self.cfg.mbps, monitor: self.monitor };
-                self.always.set(true, &settings);
-            } else {
-                if always {
-                    self.always.set(false, &crate::service::load_agent_settings());
-                }
-                self.set_login_autostart(false);
+        // With the ORBIT Service (installed ORBIT), the service shares: lock screen and UAC
+        // prompts included, always. The checkbox only decides whether sharing comes back by
+        // itself after Windows restarts (and opens ORBIT in the tray at sign-in).
+        let svc = if always { self.always.status() } else { None };
+        let svc_flag = |k: &str| svc.as_ref().and_then(|v| v[k].as_bool()).unwrap_or(false);
+        let mut auto = if always { svc_flag("share_at_boot") } else { self.cfg.autostart };
+        if widgets::check(ui, &mut auto, "START ORBIT WHEN WINDOWS STARTS") {
+            if always {
+                self.always.command(serde_json::json!({"cmd": "settings", "share_at_boot": auto}));
             }
-        }
-        if self.always.take_turned_off() {
-            self.gate = auth::Gate::load(); // the service's paired devices were copied back
-        }
-        if self.always.take_declined() {
-            // No admin permission: start with Windows the old way (no lock screen).
-            self.set_login_autostart(true);
-            self.share_error = Some("WITHOUT ADMIN PERMISSION ORBIT SHARES AFTER YOU SIGN IN, BUT NOT ON THE LOCK SCREEN".into());
-            if self.server.is_none() {
-                self.toggle_share();
-            }
-        }
-        if always && self.cfg.autostart {
-            self.set_login_autostart(false); // the service does it now
-        }
-        let hint = match (always, self.cfg.autostart) {
-            (true, _) => Some("      RUNNING · LOCK SCREEN + UAC INCLUDED"),
-            (false, true) => Some("      AFTER YOU SIGN IN (NOT ON THE LOCK SCREEN)"),
-            _ => None,
-        };
-        if let Some(h) = hint {
-            ui.label(RichText::new(h).font(FontId::monospace(9.5)).color(gray(120)));
+            self.set_login_autostart(auto);
         }
 
         let (n, pin_showing) = match self.always.devices().filter(|_| always) {
@@ -829,15 +795,15 @@ impl App {
             self.devices_open = true;
         }
 
-        if always || self.always.busy().is_some() {
-            self.always_on_status(ui);
+        if always {
+            if let Some(s) = self.server.take() {
+                s.stop(); // the service shares now; it needs the port
+            }
+            self.service_share(ui, svc_flag("sharing"));
             return;
         }
         if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
             self.toggle_share();
-        }
-        if let Some(e) = &self.always.error {
-            widgets::notice(ui, &e.to_uppercase());
         }
         let status = self.server.as_ref().map(|s| s.status.get());
         match status {
@@ -865,6 +831,8 @@ impl App {
                     widgets::notice(ui, &e.to_uppercase());
                 } else {
                     ui.label(RichText::new("ONLY PAIRED DEVICES ON YOUR TAILNET CAN CONNECT").font(FontId::monospace(10.5)).color(gray(100)));
+                    // The portable exe has no service, so the lock screen can't be shared.
+                    ui.label(RichText::new("LOCK SCREEN + UAC: USE THE INSTALLED ORBIT").font(FontId::monospace(10.5)).color(gray(80)));
                 }
             }
         }
@@ -886,28 +854,19 @@ impl App {
         }
     }
 
-    /// SHARE tab below the settings while the ORBIT Service shares this PC.
-    fn always_on_status(&mut self, ui: &mut egui::Ui) {
-        let busy = self.always.busy();
-        let (big, sub) = match busy {
-            Some(true) => ("...", "TURNING ON"),
-            Some(false) => ("...", "TURNING OFF"),
-            None => ("ON", "ALWAYS ON"),
-        };
-        if widgets::orbit_button(ui, "share", big, sub, busy.is_none(), busy.is_none()).clicked() {
-            self.share_error = Some("ORBIT SHARES THIS PC AUTOMATICALLY NOW. UNTICK START ORBIT WHEN WINDOWS STARTS TO STOP".into());
+    /// SHARE / STOP and the status, when the ORBIT Service does the sharing.
+    fn service_share(&mut self, ui: &mut egui::Ui, sharing: bool) {
+        if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
+            self.always.command(serde_json::json!({"cmd": "settings", "sharing": !sharing}));
         }
-        if busy.is_some() {
-            widgets::status_line(ui, "WAITING FOR WINDOWS' ADMIN PERMISSION...", true);
-            return;
-        }
-        match self.always.status() {
-            Some(v) => {
+        let status = self.always.status();
+        match (&status, sharing) {
+            (Some(v), true) => {
                 let s = |k: &str| v[k].as_str().map(String::from);
                 match (s("client_name"), s("client")) {
                     (Some(n), Some(c)) => widgets::status_line(ui, &format!("CONNECTED · {n} · {}", c.split(':').next().unwrap_or(&c)), true),
                     (_, Some(c)) => widgets::status_line(ui, &format!("{} IS CONNECTING...", c.split(':').next().unwrap_or(&c)), true),
-                    _ => widgets::status_line(ui, "ALWAYS ON · WAITING FOR THE OTHER PC...", true),
+                    _ => widgets::status_line(ui, "WAITING FOR THE OTHER PC TO CONNECT...", true),
                 }
                 if let Some(st) = s("stats") {
                     ui.label(RichText::new(st).font(FontId::monospace(10.5)).color(gray(170)));
@@ -919,9 +878,12 @@ impl App {
                     widgets::notice(ui, &e.to_uppercase());
                 }
             }
-            None => widgets::status_line(ui, "STARTING THE ORBIT SERVICE...", true),
+            (Some(_), false) => {
+                ui.label(RichText::new("ONLY PAIRED DEVICES ON YOUR TAILNET CAN CONNECT").font(FontId::monospace(10.5)).color(gray(100)));
+            }
+            (None, _) => widgets::status_line(ui, "STARTING THE ORBIT SERVICE...", true),
         }
-        if let Some(e) = self.always.error.clone().or(self.share_error.clone()) {
+        if let Some(e) = self.always.error.clone() {
             widgets::notice(ui, &e.to_uppercase());
         }
     }
