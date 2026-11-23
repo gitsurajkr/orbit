@@ -72,7 +72,7 @@ flowchart LR
 
 Your Tailscale devices that are online show up as buttons under the address, so you can click instead of typing an IP. If Tailscale isn't installed or signed in, ORBIT says so and offers a button to fix it; if a connection fails, it says why (not shared with you, offline, or not sharing).
 
-**Connecting to a friend's PC** (someone on another Tailscale account): on his PC, SHARE → **INVITE A FRIEND** walks through it: share the PC in Tailscale, copy a ready-made message with the download links, and show a pairing code. Only needed once.
+**Connecting to a friend's PC** (someone on another Tailscale account): CONNECT → **HOW TO CONNECT ?** → *A FRIEND'S PC* is a step-by-step guide for people who have never used Tailscale: both of you install, share your PC with the other's Gmail and accept, then either of you can control the other (a 6-digit code the first time). SHARE → **INVITE A FRIEND** has the same steps in short, with a ready-made message to send. Only needed once.
 
 The remote screen opens in its own window. To end the session, close that window, or press **DISCONNECT** in ORBIT.
 

@@ -62,6 +62,8 @@ struct App {
     devices_open: bool,
     /// The INVITE A FRIEND box is open.
     invite_open: bool,
+    /// The HOW TO CONNECT guide is open, on this page (0 my own PCs, 1 a friend).
+    help: Option<usize>,
     /// What the local Tailscale says (installed, signed in, devices), refreshed every 3 s.
     ts: Arc<Mutex<proto::tailscale::Snapshot>>,
     /// "Always on" sharing by the ORBIT Service (works on the lock screen).
@@ -120,6 +122,7 @@ impl App {
             gate: auth::Gate::load(),
             devices_open: false,
             invite_open: false,
+            help: None,
             ts: watch_tailscale(&cc.egui_ctx),
             always: crate::always_on::AlwaysOn::start(&cc.egui_ctx),
             removing: None,
@@ -271,7 +274,7 @@ impl App {
         let ts = self.ts.lock().unwrap().clone();
         let me = if ts.self_name.is_empty() { "THIS PC".to_string() } else { ts.self_name.to_uppercase() };
         let ip = self.tailscale_ip.clone().unwrap_or_else(|| "(THIS PC'S TAILSCALE IP)".into());
-        let (mut close, mut copy, mut pair) = (false, false, false);
+        let (mut close, mut copy, mut pair, mut guide) = (false, false, false, false);
         let step = |ui: &mut egui::Ui, n: &str, text: &str| {
             ui.horizontal_top(|ui| {
                 ui.label(RichText::new(n).font(FontId::monospace(16.0)).color(W));
@@ -281,27 +284,38 @@ impl App {
         let outside = modal(ctx, "invite", |ui| {
             ui.label(RichText::new("INVITE A FRIEND").font(FontId::monospace(20.0)).color(W));
             ui.add_space(4.0);
-            ui.label(RichText::new("FOR SOMEONE ON ANOTHER TAILSCALE ACCOUNT (ONCE)").font(FontId::monospace(10.5)).color(gray(120)));
+            ui.label(RichText::new("BOTH OF YOU DO THIS ONCE, THEN EITHER CAN CONTROL THE OTHER").font(FontId::monospace(10.5)).color(gray(120)));
             ui.add_space(14.0);
-            step(ui, "1", &format!("SHARE THIS PC WITH HIM IN TAILSCALE:\nCLICK ⋯ NEXT TO {me} > SHARE > HIS EMAIL"));
+            step(ui, "1", &format!("SHARE THIS PC WITH HIS GMAIL IN TAILSCALE:\nCLICK ⋯ NEXT TO {me} > SHARE > HIS GMAIL.\nHE DOES THE SAME FOR HIS PC WITH YOUR GMAIL"));
             ui.add_space(6.0);
             if widgets::button(ui, "OPEN TAILSCALE SHARING", true).clicked() {
                 open_url("https://login.tailscale.com/admin/machines");
             }
             ui.add_space(14.0);
-            step(ui, "2", "HE INSTALLS TAILSCALE + ORBIT AND\nACCEPTS YOUR SHARE EMAIL");
+            step(ui, "2", "SEND HIM THE MESSAGE: HOW TO INSTALL,\nSHARE BACK AND ACCEPT. ACCEPT HIS EMAIL TOO");
             ui.add_space(6.0);
             copy = widgets::button(ui, "COPY A MESSAGE FOR HIM", false).clicked();
             ui.add_space(14.0);
-            step(ui, "3", &format!("HE CONNECTS TO {ip}\nAND TYPES THE CODE YOU GIVE HIM"));
+            step(ui, "3", &format!("TO CONTROL THIS PC HE TYPES {ip}\nAND THE CODE YOU READ HIM (FIRST TIME)"));
             ui.add_space(6.0);
             pair = widgets::button(ui, "SHOW A CODE", false).clicked();
             ui.add_space(16.0);
-            close = widgets::button(ui, "CLOSE", false).clicked();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                close = widgets::button(ui, "CLOSE", false).clicked();
+                if widgets::button(ui, "FULL GUIDE", false).clicked() {
+                    guide = true;
+                }
+            });
         });
+        if guide {
+            self.invite_open = false;
+            self.help = Some(1);
+            return;
+        }
         if copy {
             let msg = format!(
-                "Let's connect with ORBIT:\n1. Install Tailscale: https://tailscale.com/download/windows\n2. Install ORBIT: https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe\n3. Accept the Tailscale share email I sent you\n4. In ORBIT > CONNECT type {ip}, then the code I give you"
+                "Let's connect with ORBIT (once):\n1. Install Tailscale and log in with your Gmail: https://tailscale.com/download/windows\n2. Install ORBIT: https://github.com/gitsurajkr/orbit/releases/latest/download/ORBIT-Setup.exe\n3. Accept the Tailscale share email I sent you\n4. Share your PC with my Gmail: https://login.tailscale.com/admin/machines > your PC > ... > Share\n5. ORBIT > SHARE > press SHARE, and send me your Tailscale IP\n6. To control my PC: ORBIT > CONNECT > type {ip}, then the code I give you"
             );
             ctx.output_mut(|o| o.copied_text = msg);
             self.copied_at = Some(Instant::now());
@@ -317,6 +331,109 @@ impl App {
         }
         if close || outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.invite_open = false;
+        }
+    }
+
+    /// HOW TO CONNECT: step by step, for someone who has never used Tailscale. Two pages: my own
+    /// PCs (one Tailscale account) and a friend's (two accounts: one share + one code).
+    fn help_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut page) = self.help else { return };
+        let ts = self.ts.lock().unwrap().clone();
+        let me = if ts.self_name.is_empty() { "THIS PC".to_string() } else { ts.self_name.to_uppercase() };
+        let ip = self.tailscale_ip.clone().unwrap_or_else(|| "(ITS TAILSCALE IP)".into());
+        let mut close = false;
+        let mut actions: Vec<&'static str> = Vec::new();
+        // One step: number, who does it, what to do, and an optional button (name, action id).
+        let step = |ui: &mut egui::Ui, n: usize, who: &str, text: String, button: Option<(&str, &'static str)>, actions: &mut Vec<&'static str>| {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(format!("{n:>2}")).font(FontId::monospace(16.0)).color(W));
+                ui.vertical(|ui| {
+                    if !who.is_empty() {
+                        ui.label(RichText::new(who).font(FontId::monospace(9.5)).color(gray(130)));
+                    }
+                    ui.label(RichText::new(text).font(FontId::monospace(11.0)).color(gray(200)));
+                    if let Some((label, id)) = button {
+                        ui.add_space(4.0);
+                        if widgets::button(ui, label, false).clicked() {
+                            actions.push(id);
+                        }
+                    }
+                });
+            });
+            ui.add_space(10.0);
+        };
+        let outside = modal(ctx, "help", |ui| {
+            ui.label(RichText::new("HOW TO CONNECT").font(FontId::monospace(20.0)).color(W));
+            ui.add_space(8.0);
+            widgets::segmented(ui, &["MY OWN PCS".to_string(), "A FRIEND'S PC".to_string()], &mut page, true);
+            ui.add_space(10.0);
+            egui::ScrollArea::vertical().max_height(470.0).show(ui, |ui| {
+                if page == 0 {
+                    ui.label(RichText::new("BOTH PCS ARE YOURS: ONE GMAIL FOR BOTH. NO CODES.").font(FontId::monospace(10.0)).color(gray(130)));
+                    ui.add_space(10.0);
+                    step(ui, 1, "ON BOTH PCS", "DOWNLOAD TAILSCALE AND INSTALL IT".into(), Some(("OPEN DOWNLOAD PAGE", "ts_download")), &mut actions);
+                    step(ui, 2, "ON BOTH PCS", "CLICK THE TAILSCALE ICON BY THE CLOCK >\nLOG IN > GOOGLE > THE SAME GMAIL ON BOTH >\nCONNECT".into(), None, &mut actions);
+                    step(ui, 3, "ON BOTH PCS", "DOWNLOAD ORBIT AND INSTALL IT".into(), Some(("DOWNLOAD ORBIT", "orbit_download")), &mut actions);
+                    step(ui, 4, "PC TO CONTROL", "ORBIT > SHARE > PRESS SHARE".into(), None, &mut actions);
+                    step(ui, 5, "YOUR PC", "ORBIT > CONNECT > CLICK ITS NAME UNDER\nONLINE (OR TYPE ITS IP) > CONNECT. DONE".into(), None, &mut actions);
+                    ui.label(RichText::new("ONLY FOR YOUR OWN PCS: ANYONE ON YOUR GMAIL\nCAN CONNECT WITHOUT A CODE").font(FontId::monospace(10.0)).color(gray(130)));
+                } else {
+                    ui.label(RichText::new("YOU AND A FRIEND, EACH WITH YOUR OWN GMAIL.\nBOTH OF YOU DO EVERY STEP, ONCE. THEN EITHER\nOF YOU CAN CONTROL THE OTHER'S PC.").font(FontId::monospace(10.0)).color(gray(130)));
+                    ui.add_space(10.0);
+                    step(ui, 1, "BOTH", "DOWNLOAD TAILSCALE AND INSTALL IT".into(), Some(("OPEN DOWNLOAD PAGE", "ts_download")), &mut actions);
+                    step(ui, 2, "BOTH", "CLICK THE TAILSCALE ICON BY THE CLOCK >\nLOG IN > GOOGLE > YOUR OWN GMAIL > CONNECT".into(), None, &mut actions);
+                    step(ui, 3, "BOTH", "DOWNLOAD ORBIT AND INSTALL IT".into(), Some(("DOWNLOAD ORBIT", "orbit_download")), &mut actions);
+                    step(
+                        ui,
+                        4,
+                        "BOTH",
+                        format!("OPEN TAILSCALE IN THE BROWSER > MACHINES >\nFIND YOUR PC (HERE: {me}) > CLICK ⋯ > SHARE >\nTYPE THE OTHER PERSON'S GMAIL > SHARE"),
+                        Some(("OPEN TAILSCALE MACHINES", "ts_machines")),
+                        &mut actions,
+                    );
+                    step(ui, 5, "BOTH", "OPEN GMAIL > THE EMAIL FROM TAILSCALE >\nACCEPT. THE OTHER PC NOW SHOWS IN TAILSCALE".into(), Some(("OPEN GMAIL", "gmail")), &mut actions);
+                    step(ui, 6, "BOTH", format!("ORBIT > SHARE > PRESS SHARE.\nSEND THE OTHER PERSON YOUR IP.\nTHIS PC'S IP: {ip}"), Some(("COPY MY IP", "copy_ip")), &mut actions);
+                    step(
+                        ui,
+                        7,
+                        "TO CONTROL THE OTHER PC",
+                        "ORBIT > CONNECT > TYPE THEIR IP > CONNECT.\nTHE FIRST TIME, THEY PRESS SHOW A CODE AND\nREAD YOU THE 6 DIGITS; YOU TYPE THEM".into(),
+                        Some(("SHOW A CODE", "code")),
+                        &mut actions,
+                    );
+                    step(ui, 8, "", "DONE. FROM NOW ON: ONE PRESSES SHARE,\nTHE OTHER PRESSES CONNECT. NO CODE".into(), None, &mut actions);
+                }
+            });
+            ui.add_space(12.0);
+            close = widgets::button(ui, "CLOSE", false).clicked();
+        });
+        for a in actions {
+            match a {
+                "ts_download" => open_url("https://tailscale.com/download/windows"),
+                "orbit_download" => open_url("https://github.com/gitsurajkr/orbit/releases/latest"),
+                "ts_machines" => open_url("https://login.tailscale.com/admin/machines"),
+                "gmail" => open_url("https://mail.google.com"),
+                "copy_ip" => {
+                    if let Some(ip) = &self.tailscale_ip {
+                        ctx.output_mut(|o| o.copied_text = ip.clone());
+                    }
+                }
+                "code" => {
+                    self.help = None;
+                    self.devices_open = true;
+                    if self.always.running() {
+                        self.always.command(serde_json::json!({"cmd": "pin_start"}));
+                    } else {
+                        self.gate.start_pin();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.help = Some(page);
+        if close || outside || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.help = None;
         }
     }
 
@@ -717,6 +834,9 @@ impl eframe::App for App {
         if self.invite_open {
             self.invite_dialog(ctx);
         }
+        if self.help.is_some() {
+            self.help_dialog(ctx);
+        }
         if self.prompt.is_some() && self.viewer.is_none() {
             self.prompt_dialog(ctx);
         }
@@ -820,6 +940,10 @@ impl App {
             widgets::notice(ui, &e.to_uppercase());
         } else {
             ui.label(RichText::new("CTRL+ALT+ENTER IN THE VIEWER: FULLSCREEN").font(FontId::monospace(10.5)).color(gray(100)));
+        }
+        ui.add_space(6.0);
+        if widgets::chip(ui, "HOW TO CONNECT  ?").clicked() {
+            self.help = Some(0);
         }
     }
 
