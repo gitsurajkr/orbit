@@ -5,12 +5,15 @@
 //!   viewer window (started by the launcher as a separate process, so the launcher's UI toolkit
 //!   and the viewer's D3D/Media Foundation setup never share a thread). Its exit code tells the
 //!   launcher why it couldn't connect (see [`viewer_exit_code`]).
+//! - `orbit.exe --service` / `--agent` → always-on sharing incl. the lock screen (service.rs);
+//!   `--install-service` / `--uninstall-service` (as administrator) turn it on and off.
 
 #![windows_subsystem = "windows"]
 
 mod autostart;
 mod config;
 mod icon;
+mod service;
 mod tray;
 mod ui;
 mod update;
@@ -23,6 +26,26 @@ fn main() {
             Ok(Some(r)) => println!("update available: v{} (this is v{})", r.version, update::CURRENT),
             Ok(None) => println!("up to date (v{})", update::CURRENT),
             Err(e) => println!("check failed: {e:#}"),
+        }
+        return;
+    }
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    if flag("--service") {
+        let _ = service::run();
+        return;
+    }
+    if flag("--agent") {
+        if let Err(e) = service::run_agent() {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if flag("--install-service") || flag("--uninstall-service") {
+        let r = if flag("--install-service") { service::install() } else { service::uninstall() };
+        if let Err(e) = r {
+            eprintln!("{e:#}");
+            std::process::exit(1);
         }
         return;
     }
