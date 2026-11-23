@@ -58,6 +58,28 @@ pub fn parse_path(json: &str, ip: IpAddr) -> Option<Path> {
     })
 }
 
+/// True if the peer at `ip` is logged into the same Tailscale account (user) as this PC.
+/// Tailscale proves that cryptographically when a device joins, so ORBIT can trust it.
+/// Peers of other users (shared machines, other people on the tailnet) are false.
+pub fn parse_same_account(json: &str, ip: IpAddr) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let ip = ip.to_canonical().to_string();
+    let me = v.get("Self")?.get("UserID")?.as_u64()?;
+    let peer = v.get("Peer")?.as_object()?.values().find(|p| {
+        p.get("TailscaleIPs").and_then(|a| a.as_array()).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(ip.as_str())))
+    })?;
+    // Shared-in machines from other tailnets carry the sharer's user, but not this tailnet's.
+    if peer.get("ShareeNode").and_then(|x| x.as_bool()) == Some(true) {
+        return Some(false);
+    }
+    Some(peer.get("UserID")?.as_u64()? == me)
+}
+
+/// [`parse_same_account`] on live `tailscale status`; None if Tailscale can't be asked.
+pub fn same_account(ip: IpAddr) -> Option<bool> {
+    parse_same_account(&status_json()?, ip)
+}
+
 /// Runs `tailscale status --json` (no console window) and returns its output.
 fn status_json() -> Option<String> {
     let installed = std::path::Path::new(r"C:\Program Files\Tailscale\tailscale.exe");
@@ -154,6 +176,18 @@ mod tests {
         assert_eq!(parse_path(&status("", "bom", "", false), ip), None);
         assert_eq!(parse_path(&status("", "bom", "", true), "100.2.2.2".parse().unwrap()), None);
         assert_eq!(parse_path("not json", ip), None);
+    }
+
+    #[test]
+    fn same_account_compares_user_ids() {
+        let j = r#"{"Self":{"UserID":5,"TailscaleIPs":["100.1.1.1"]},"Peer":{
+            "a":{"TailscaleIPs":["100.2.2.2"],"UserID":5},
+            "b":{"TailscaleIPs":["100.3.3.3"],"UserID":6},
+            "c":{"TailscaleIPs":["100.4.4.4"],"UserID":5,"ShareeNode":true}}}"#;
+        assert_eq!(parse_same_account(j, "100.2.2.2".parse().unwrap()), Some(true));
+        assert_eq!(parse_same_account(j, "100.3.3.3".parse().unwrap()), Some(false));
+        assert_eq!(parse_same_account(j, "100.4.4.4".parse().unwrap()), Some(false));
+        assert_eq!(parse_same_account(j, "100.9.9.9".parse().unwrap()), None);
     }
 
     #[test]

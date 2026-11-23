@@ -27,8 +27,16 @@ pub fn run(launched_at_login: bool) -> Result<(), String> {
     eframe::run_native("ORBIT", options, Box::new(move |cc| Ok(Box::new(App::new(cc, launched_at_login))))).map_err(|e| e.to_string())
 }
 
-/// Result of a viewer process: Ok on a normal close, Err(message) if it failed.
-type ViewerResult = Arc<Mutex<Option<Result<(), String>>>>;
+/// Result of a viewer process: Ok on a normal close, Err((exit code, message)) if it failed.
+type ViewerResult = Arc<Mutex<Option<Result<(), (i32, String)>>>>;
+
+/// A question for the user before connecting again.
+enum Prompt {
+    /// Type the 6-digit code. `hint` explains where it comes from; `error` is the last refusal.
+    Code { text: String, hint: String, error: Option<String> },
+    /// The sharing PC's ID changed: connect anyway?
+    NewIdentity { message: String },
+}
 
 struct App {
     cfg: Config,
@@ -42,6 +50,18 @@ struct App {
     /// When the user confirmed a disconnect (force-close the viewer if it hangs).
     disconnect_at: Option<Instant>,
     connect_error: Option<String>,
+    /// Pairing question shown over the window (code, or changed ID).
+    prompt: Option<Prompt>,
+    /// The last connection attempt carried a pairing code.
+    tried_code: bool,
+    /// This PC's ID certificate (Err: couldn't be loaded or made).
+    identity: Result<auth::Identity, String>,
+    /// Devices allowed to connect to this PC, and the pairing code.
+    gate: Arc<auth::Gate>,
+    /// The PAIRED DEVICES box is open.
+    devices_open: bool,
+    /// A device whose REMOVE was clicked once (click again to confirm).
+    removing: Option<auth::Fingerprint>,
     server: Option<server::ServerHandle>,
     share_error: Option<String>,
     monitors: Vec<server::capture::MonitorInfo>,
@@ -88,6 +108,12 @@ impl App {
             confirm_disconnect: false,
             disconnect_at: None,
             connect_error: None,
+            prompt: None,
+            tried_code: false,
+            identity: auth::Identity::load_or_create().map_err(|e| format!("{e:#}")),
+            gate: auth::Gate::load(),
+            devices_open: false,
+            removing: None,
             server: None,
             share_error: None,
             monitors: server::capture::list_monitors().unwrap_or_default(),
@@ -106,6 +132,14 @@ impl App {
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
+        self.connect_with(ctx, None, false);
+    }
+
+    /// Starts the viewer; `code` is a pairing code the user typed, `accept_new_identity` that
+    /// they chose to connect although the other PC's ID changed.
+    fn connect_with(&mut self, ctx: &egui::Context, code: Option<String>, accept_new_identity: bool) {
+        self.prompt = None;
+        self.tried_code = code.is_some();
         let addr = self.addr.trim().to_string();
         if addr.is_empty() {
             self.connect_error = Some("TYPE THE OTHER PC'S TAILSCALE IP FIRST (e.g. 100.101.102.103)".into());
@@ -126,6 +160,12 @@ impl App {
         if self.cfg.view_only {
             cmd.arg("--view-only");
         }
+        if let Some(c) = &code {
+            cmd.arg("--code").arg(c);
+        }
+        if accept_new_identity {
+            cmd.arg("--accept-new-identity");
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -142,9 +182,9 @@ impl App {
             if let Some(mut e) = child.stderr.take() {
                 let _ = e.read_to_string(&mut err);
             }
-            let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
             let msg = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("the viewer closed unexpectedly").to_string();
-            *r.lock().unwrap() = Some(if ok { Ok(()) } else { Err(msg) });
+            *r.lock().unwrap() = Some(if code == 0 { Ok(()) } else { Err((code, msg)) });
             ctx2.request_repaint();
         });
         self.viewer = Some(result);
@@ -158,13 +198,201 @@ impl App {
             self.viewer_pid = None;
             self.confirm_disconnect = false;
             let asked = self.disconnect_at.take().is_some();
-            if let Err(e) = r {
+            if let Err((code, msg)) = r {
                 if !asked {
-                    self.connect_error = Some(e); // a disconnect the user asked for isn't an error
+                    // A disconnect the user asked for isn't an error.
+                    self.on_viewer_error(code, msg);
                 }
             }
             self.from_tray(ctx);
         }
+    }
+
+    /// Turns a failed connection into a question (pairing code, changed ID) or an error line.
+    fn on_viewer_error(&mut self, code: i32, msg: String) {
+        use crate::exit::*;
+        let pc = self.viewer_addr.clone();
+        self.prompt = match code {
+            NEED_CODE => Some(Prompt::Code { text: String::new(), hint: format!("{pc} IS SHOWING A PAIRING CODE.\nTYPE IT HERE:"), error: None }),
+            NOT_PAIRED => Some(Prompt::Code {
+                text: String::new(),
+                hint: format!("THIS PC ISN'T PAIRED WITH {pc} YET.\n\nON {pc}: ORBIT > SHARE > PAIRED DEVICES > PAIR A NEW DEVICE.\nTHEN TYPE THE CODE IT SHOWS:"),
+                error: None,
+            }),
+            DENIED if self.tried_code => Some(Prompt::Code {
+                text: String::new(),
+                hint: format!("TYPE THE PAIRING CODE SHOWN ON {pc}:"),
+                error: Some(msg.trim_start_matches("refused: ").to_uppercase()),
+            }),
+            IDENTITY_CHANGED => Some(Prompt::NewIdentity { message: format!("{}.", msg.split(". Expected").next().unwrap_or(&msg)) }),
+            _ => None,
+        };
+        if self.prompt.is_none() {
+            self.connect_error = Some(msg);
+        }
+    }
+
+    /// The pairing question over a dimmed window: type the code, or accept a changed ID.
+    fn prompt_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.prompt.as_mut() else { return };
+        let (mut cancel, mut go) = (false, false);
+        let mut submit_code = None;
+        let accept_identity;
+        let outside = modal(ctx, "prompt", |ui| match prompt {
+            Prompt::Code { text, hint, error } => {
+                ui.label(RichText::new("PAIR WITH THIS PC").font(FontId::monospace(20.0)).color(W));
+                ui.add_space(10.0);
+                ui.label(RichText::new(hint.as_str()).font(FontId::monospace(11.5)).color(gray(170)));
+                ui.add_space(12.0);
+                let resp = ui.add(
+                    TextEdit::singleline(text)
+                        .font(FontId::monospace(30.0))
+                        .hint_text(RichText::new("000000").color(gray(60)).font(FontId::monospace(30.0)))
+                        .text_color(W)
+                        .frame(false)
+                        .horizontal_align(egui::Align::Center)
+                        .desired_width(ui.available_width()),
+                );
+                text.retain(|c| c.is_ascii_digit());
+                text.truncate(6);
+                resp.request_focus();
+                let r = resp.rect;
+                ui.painter().line_segment([pos2(r.left(), r.bottom() + 4.0), pos2(r.right(), r.bottom() + 4.0)], stk(1.0, gray(120)));
+                ui.add_space(12.0);
+                if let Some(e) = error {
+                    widgets::notice(ui, e);
+                    ui.add_space(10.0);
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                    cancel |= widgets::button(ui, "CANCEL", false).clicked();
+                    go |= widgets::button(ui, "PAIR + CONNECT", true).clicked();
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("THE CODE IS ONLY NEEDED ONCE PER DEVICE").font(FontId::monospace(10.0)).color(gray(100)));
+                go |= ui.input(|i| i.key_pressed(Key::Enter));
+                if go && text.len() == 6 {
+                    submit_code = Some(text.clone());
+                }
+            }
+            Prompt::NewIdentity { message } => {
+                ui.label(RichText::new("THIS PC'S ID CHANGED").font(FontId::monospace(20.0)).color(W));
+                ui.add_space(10.0);
+                ui.label(RichText::new(message.to_uppercase()).font(FontId::monospace(11.5)).color(gray(170)));
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("IF YOU REINSTALLED ORBIT OR WINDOWS ON THAT PC, CONNECT ANYWAY. IF NOT, SOMETHING ELSE MAY BE ANSWERING AT THAT ADDRESS.")
+                        .font(FontId::monospace(11.5))
+                        .color(gray(170)),
+                );
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                    cancel |= widgets::button(ui, "CANCEL", true).clicked();
+                    go |= widgets::button(ui, "CONNECT ANYWAY", false).clicked();
+                });
+            }
+        });
+        cancel |= outside;
+        accept_identity = go && matches!(self.prompt, Some(Prompt::NewIdentity { .. }));
+        if cancel || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.prompt = None;
+        } else if let Some(code) = submit_code {
+            self.connect_with(ctx, Some(code), false);
+        } else if accept_identity {
+            self.connect_with(ctx, None, true);
+        }
+    }
+
+    /// PAIRED DEVICES: who may connect to this PC, and the code for a new device.
+    fn devices_dialog(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let devices = self.gate.devices();
+        let mut trust_own = self.gate.trust_own_account();
+        let pin = self.gate.pin();
+        let sharing = self.server.is_some();
+        let (mut remove, mut start_pin, mut cancel_pin, mut toggled) = (None, false, false, false);
+        let removing = self.removing;
+        let my_id = self.identity.as_ref().map(|i| auth::short(&i.fingerprint())).unwrap_or_default();
+        let outside = modal(ctx, "devices", |ui| {
+            ui.label(RichText::new("PAIRED DEVICES").font(FontId::monospace(20.0)).color(W));
+            ui.add_space(4.0);
+            ui.label(RichText::new("THESE PCS CAN CONNECT TO THIS ONE").font(FontId::monospace(10.5)).color(gray(120)));
+            ui.add_space(12.0);
+            if devices.is_empty() {
+                ui.label(RichText::new("NONE YET").font(FontId::monospace(12.0)).color(gray(150)));
+            }
+            egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                for d in &devices {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&d.name).font(FontId::monospace(13.5)).color(W));
+                            ui.label(RichText::new(format!("{} · {}", d.how.to_uppercase(), ago(d.paired_unix))).font(FontId::monospace(9.5)).color(gray(120)));
+                            ui.label(RichText::new(format!("ID {}", auth::short(&d.fp))).font(FontId::monospace(9.5)).color(gray(90)));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let sure = removing == Some(d.fp);
+                            if widgets::button(ui, if sure { "SURE?" } else { "REMOVE" }, sure).clicked() {
+                                remove = Some((d.fp, sure));
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+            ui.add_space(8.0);
+            toggled = widgets::check(ui, &mut trust_own, "LET IN MY OWN TAILSCALE DEVICES");
+            ui.label(RichText::new("      ANY DEVICE ON THIS PC'S TAILSCALE ACCOUNT\n      PAIRS ITSELF, WITHOUT A CODE").font(FontId::monospace(9.5)).color(gray(120)));
+            ui.add_space(14.0);
+            match &pin {
+                Some((code, left)) => {
+                    ui.label(RichText::new("PAIRING CODE · TYPE IT ON THE OTHER PC").font(FontId::monospace(10.5)).color(gray(150)));
+                    ui.label(RichText::new(format!("{} {}", &code[..3], &code[3..])).font(FontId::monospace(40.0)).color(W));
+                    ui.horizontal(|ui| {
+                        let s = left.as_secs();
+                        ui.label(RichText::new(format!("VALID {}:{:02} · ONE DEVICE", s / 60, s % 60)).font(FontId::monospace(10.5)).color(gray(150)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            cancel_pin = widgets::button(ui, "CANCEL CODE", false).clicked();
+                        });
+                    });
+                    if !sharing {
+                        ui.add_space(6.0);
+                        widgets::notice(ui, "START SHARING, OR THE OTHER PC CAN'T REACH THIS ONE");
+                    }
+                }
+                None => start_pin = widgets::button(ui, "PAIR A NEW DEVICE", true).clicked(),
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                close |= widgets::button(ui, "CLOSE", false).clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("THIS PC'S ID {my_id}")).font(FontId::monospace(9.5)).color(gray(100)));
+                });
+            });
+        });
+        close |= outside;
+        match remove {
+            Some((fp, true)) => {
+                self.gate.remove(&fp);
+                self.removing = None;
+            }
+            Some((fp, false)) => self.removing = Some(fp),
+            None => {}
+        }
+        if toggled {
+            self.gate.set_trust_own_account(trust_own);
+        }
+        if start_pin {
+            self.gate.start_pin();
+        }
+        if cancel_pin {
+            self.gate.cancel_pin();
+        }
+        if close || (self.prompt.is_none() && ctx.input(|i| i.key_pressed(Key::Escape))) {
+            self.devices_open = false;
+            self.removing = None;
+        }
+        ctx.request_repaint_after(Duration::from_millis(500)); // countdown, and new pairings
     }
 
     /// Sends the window to the tray (no taskbar button), or minimizes it without a tray.
@@ -191,9 +419,11 @@ impl App {
         if self.viewer.is_some() {
             format!("ORBIT · CONNECTED TO {}", self.viewer_addr)
         } else if let Some(s) = &self.server {
-            match s.status.get().client {
-                Some(c) => format!("ORBIT · SHARING · {} CONNECTED", c.split(':').next().unwrap_or(&c)),
-                None => "ORBIT · SHARING · WAITING".into(),
+            let st = s.status.get();
+            match (st.client_name, st.client) {
+                (Some(n), _) => format!("ORBIT · SHARING · {n} CONNECTED"),
+                (None, Some(c)) => format!("ORBIT · SHARING · {} CONNECTING", c.split(':').next().unwrap_or(&c)),
+                (None, None) => "ORBIT · SHARING · WAITING".into(),
             }
         } else {
             "ORBIT".into()
@@ -267,7 +497,14 @@ impl App {
         self.share_error = None;
         let start = || -> anyhow::Result<server::ServerHandle> {
             let mon = server::preflight(self.monitor)?;
-            let settings = server::Settings { monitor: mon, fps: FPS_OPTIONS[self.cfg.fps_index], bitrate_bps: (self.cfg.mbps * 1e6) as u32 };
+            let identity = self.identity.clone().map_err(|e| anyhow::anyhow!("this PC's ID certificate: {e}"))?;
+            let settings = server::Settings {
+                monitor: mon,
+                fps: FPS_OPTIONS[self.cfg.fps_index],
+                bitrate_bps: (self.cfg.mbps * 1e6) as u32,
+                identity,
+                gate: self.gate.clone(),
+            };
             // Listens on all addresses but only accepts Tailscale peers, so sharing can start
             // before Tailscale is up (e.g. right after boot) and survives Tailscale restarts.
             server::ServerHandle::start(settings, server::net::default_bind())
@@ -354,6 +591,12 @@ impl eframe::App for App {
         });
         if self.confirm_disconnect && self.viewer.is_some() {
             self.disconnect_dialog(ctx);
+        }
+        if self.devices_open {
+            self.devices_dialog(ctx);
+        }
+        if self.prompt.is_some() && self.viewer.is_none() {
+            self.prompt_dialog(ctx);
         }
     }
 
@@ -487,15 +730,22 @@ impl App {
             }
         }
 
+        let n = self.gate.devices().len();
+        let pairing = if self.gate.pin().is_some() { " · CODE SHOWING" } else { "" };
+        if widgets::chip(ui, &format!("PAIRED DEVICES · {n}{pairing}  >")).clicked() {
+            self.devices_open = true;
+        }
+
         if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
             self.toggle_share();
         }
         let status = self.server.as_ref().map(|s| s.status.get());
         match status {
             Some(st) => {
-                match &st.client {
-                    Some(c) => widgets::status_line(ui, &format!("CONNECTED · {}", c.split(':').next().unwrap_or(c)), true),
-                    None => widgets::status_line(ui, "WAITING FOR THE OTHER PC TO CONNECT...", true),
+                match (&st.client_name, &st.client) {
+                    (Some(n), Some(c)) => widgets::status_line(ui, &format!("CONNECTED · {n} · {}", c.split(':').next().unwrap_or(c)), true),
+                    (_, Some(c)) => widgets::status_line(ui, &format!("{} IS CONNECTING...", c.split(':').next().unwrap_or(c)), true),
+                    _ => widgets::status_line(ui, "WAITING FOR THE OTHER PC TO CONNECT...", true),
                 }
                 if let Some(s) = &st.stats {
                     ui.label(RichText::new(s).font(FontId::monospace(10.5)).color(gray(170)));
@@ -511,7 +761,7 @@ impl App {
                     }
                     widgets::notice(ui, &e.to_uppercase());
                 } else {
-                    ui.label(RichText::new("ONLY DEVICES ON YOUR TAILNET CAN REACH THIS PC").font(FontId::monospace(10.5)).color(gray(100)));
+                    ui.label(RichText::new("ONLY PAIRED DEVICES ON YOUR TAILNET CAN CONNECT").font(FontId::monospace(10.5)).color(gray(100)));
                 }
             }
         }
@@ -759,5 +1009,33 @@ fn kill_viewer(pid: u32) {
             let _ = TerminateProcess(h, 1);
             let _ = CloseHandle(h);
         }
+    }
+}
+
+/// A box over the dimmed window. Returns true when the user clicked outside it.
+fn modal(ctx: &egui::Context, id: &str, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    let mut outside = false;
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new(id).with("dim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+        let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+        ui.painter().rect_filled(r, 0.0, egui::Color32::from_black_alpha(215));
+        outside = resp.clicked();
+    });
+    egui::Area::new(egui::Id::new(id)).order(egui::Order::Tooltip).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+        egui::Frame::none().fill(B).stroke(stk(1.0, W)).inner_margin(egui::Margin::same(22.0)).show(ui, |ui| {
+            ui.set_width(360.0);
+            add(ui);
+        });
+    });
+    outside
+}
+
+/// "TODAY", "YESTERDAY", "5 DAYS AGO" for a unix time.
+fn ago(unix: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    match now.saturating_sub(unix) / 86_400 {
+        0 => "TODAY".into(),
+        1 => "YESTERDAY".into(),
+        d => format!("{d} DAYS AGO"),
     }
 }

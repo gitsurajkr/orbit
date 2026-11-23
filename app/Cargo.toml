@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 proto.workspace = true
+auth = { path = "../auth" }
 server = { path = "../server" }
 client = { path = "../client" }
 ureq = { version = "2", features = ["json"] }

@@ -8,4 +8,5 @@ mod net;
 mod render;
 mod viewer;
 
+pub use net::{AuthError, ConnectOptions};
 pub use viewer::run_viewer;

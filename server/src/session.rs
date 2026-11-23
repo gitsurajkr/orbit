@@ -1,4 +1,5 @@
-//! One client session: QUIC handshake, the video thread, control messages and input.
+//! One client session: QUIC handshake, admission (device list / pairing code), the video
+//! thread, control messages and input. Nothing is captured or injected before admission.
 //!
 //! ```text
 //!             ┌────────────── video thread (std) ──────────────┐
@@ -33,6 +34,10 @@ pub struct Settings {
     pub monitor: MonitorInfo,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// This PC's certificate and key.
+    pub identity: auth::Identity,
+    /// Who may connect (shared with the UI, which shows and edits it).
+    pub gate: Arc<auth::Gate>,
 }
 
 struct Shared {
@@ -53,6 +58,8 @@ pub struct Status {
 pub struct StatusInfo {
     /// Address of the connected client, if any.
     pub client: Option<String>,
+    /// Its PC name, once it's been let in.
+    pub client_name: Option<String>,
     /// Latest once-a-second stats line.
     pub stats: Option<String>,
     /// Latest problem (cleared when things work again).
@@ -99,6 +106,7 @@ pub async fn serve(endpoint: quinn::Endpoint, settings: Settings, status: Arc<St
             let addr = c.remote_address().to_string();
             status.update(|i| {
                 i.client = Some(addr.clone());
+                i.client_name = None;
                 i.stats = None;
                 i.error = None;
             });
@@ -110,6 +118,7 @@ pub async fn serve(endpoint: quinn::Endpoint, settings: Settings, status: Arc<St
             status.update(|i| {
                 if i.client.as_deref() == Some(addr.as_str()) {
                     i.client = None;
+                    i.client_name = None;
                     i.stats = None;
                 }
                 if let Err(e) = r {
@@ -169,7 +178,7 @@ pub async fn serve_until_stopped(mut endpoint: quinn::Endpoint, bind: std::net::
             if ctl.stopping.load(Ordering::Acquire) {
                 return Ok(());
             }
-            match crate::net::endpoint(bind) {
+            match crate::net::endpoint(bind, &settings.identity) {
                 Ok(e) => break e,
                 Err(e) => {
                     eprintln!("restarting listener: {e:#}; retrying");
@@ -193,7 +202,7 @@ impl ServerHandle {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
         let endpoint = {
             let _guard = rt.enter();
-            crate::net::endpoint(bind)?
+            crate::net::endpoint(bind, &settings.identity)?
         };
         let status = Arc::new(Status::default());
         let ctl = Arc::new(Control::default());
@@ -230,12 +239,87 @@ async fn write_ctrl(w: &mut SendStream, c: &Ctrl) -> Result<()> {
     Ok(())
 }
 
+/// SHA-256 of the certificate the peer showed in the TLS handshake.
+fn peer_fingerprint(conn: &Connection) -> Option<auth::Fingerprint> {
+    let certs = conn.peer_identity()?.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok()?;
+    certs.first().map(|c| auth::fingerprint(c))
+}
+
+/// Tells the viewer why it's refused, then fails the session with the same reason.
+async fn deny<T>(send: &mut SendStream, reason: &str) -> Result<T> {
+    let _ = write_ctrl(send, &Ctrl::Denied { reason: reason.to_string() }).await;
+    let _ = send.finish();
+    tokio::time::sleep(Duration::from_millis(200)).await; // let it arrive before the close
+    bail!("refused: {reason}")
+}
+
+/// Decides whether this viewer may in, and returns the name to show for it:
+/// 1. its certificate is on the device list → in;
+/// 2. it's on this PC's own Tailscale account (and that's allowed) → added to the list, in;
+/// 3. a pairing code is showing on this PC → the viewer proves it knows it → added, in;
+/// 4. otherwise → told to pair, refused.
+async fn admit(conn: &Connection, send: &mut SendStream, recv: &mut RecvStream, s: &Settings, name: String) -> Result<(String, auth::Fingerprint)> {
+    let name = if name.trim().is_empty() { "unnamed PC".to_string() } else { name };
+    let Some(fp) = peer_fingerprint(conn) else {
+        return deny(send, "this viewer has no ID certificate: update ORBIT").await;
+    };
+    if let Some(d) = s.gate.trusted(&fp) {
+        if d.name != name {
+            s.gate.add(&name, fp, &d.how); // keep the list's name current
+        }
+        return Ok((name, fp));
+    }
+    let ip = conn.remote_address().ip().to_canonical();
+    if s.gate.trust_own_account() {
+        let same = ip.is_loopback() || tokio::task::spawn_blocking(move || proto::tailscale::same_account(ip)).await?.unwrap_or(false);
+        if same {
+            println!("pairing {name} ({}): same Tailscale account", auth::short(&fp));
+            s.gate.add(&name, fp, "same Tailscale account");
+            return Ok((name, fp));
+        }
+    }
+    let code_active = s.gate.pin().is_some();
+    write_ctrl(send, &Ctrl::PairRequired { code_active }).await?;
+    if !code_active {
+        // The viewer explains what to do and disconnects.
+        let _ = tokio::time::timeout(Duration::from_secs(2), read_ctrl(recv)).await;
+        bail!("{name} isn't paired (no pairing code was showing)");
+    }
+    let msg = match read_ctrl(recv).await {
+        Ok(Ctrl::PairStart { msg }) => msg,
+        Ok(other) => bail!("expected a pairing message, got {other:?}"),
+        Err(_) => bail!("{name} isn't paired; it can pair with the code shown on this PC"),
+    };
+    let Some(code) = s.gate.try_pin() else {
+        return deny(send, "the pairing code expired or had too many wrong tries: show a new one on the sharing PC").await;
+    };
+    let my_fp = s.identity.fingerprint();
+    let (reply, key) = auth::pake::respond(&code, &fp, &my_fp, &msg)?;
+    write_ctrl(send, &Ctrl::PairReply { msg: reply }).await?;
+    match read_ctrl(recv).await? {
+        Ctrl::PairProof { proof } if key.check_viewer(&proof) => {}
+        Ctrl::PairProof { .. } => return deny(send, "wrong pairing code").await,
+        other => bail!("expected a pairing proof, got {other:?}"),
+    }
+    write_ctrl(send, &Ctrl::PairProof { proof: key.proof_from_sharer().to_vec() }).await?;
+    s.gate.cancel_pin();
+    println!("paired {name} ({}) with the code", auth::short(&fp));
+    s.gate.add(&name, fp, "code");
+    Ok((name, fp))
+}
+
 async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: Arc<Status>) -> Result<()> {
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.accept_bi()).await.context("no control stream")??;
-    match read_ctrl(&mut recv).await? {
-        Ctrl::ClientHello { version } => ensure!(version == proto::VERSION, "client protocol {version}, server {}", proto::VERSION),
+    let name = match read_ctrl(&mut recv).await? {
+        Ctrl::ClientHello { version, name } => {
+            ensure!(version == proto::VERSION, "client protocol {version}, server {}: update ORBIT on both PCs", proto::VERSION);
+            name
+        }
         other => bail!("expected hello, got {other:?}"),
-    }
+    };
+    let (name, fp) = tokio::time::timeout(Duration::from_secs(20), admit(&conn, &mut send, &mut recv, &s, name)).await.context("pairing took too long")??;
+    println!("let in: {name} ({})", conn.remote_address());
+    status.update(|i| i.client_name = Some(name.clone()));
     write_ctrl(&mut send, &Ctrl::ServerHello { version: proto::VERSION, width: s.monitor.width as u16, height: s.monitor.height as u16, fps: s.fps as u16 }).await?;
 
     let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
@@ -266,6 +350,16 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
             }
         }
     };
+    // Removing the device from the list on this PC ends its session too.
+    let still_trusted = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if s.gate.trusted(&fp).is_none() {
+                bail!("{name} was removed from the paired devices");
+            }
+        }
+    };
     let ctrl = async {
         loop {
             match read_ctrl(&mut recv).await? {
@@ -291,6 +385,10 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         r = dgrams => r,
         r = writer => r,
         r = cursor => r,
+        r = still_trusted => {
+            conn.close(1u32.into(), b"removed from paired devices");
+            r
+        }
     };
     stop.store(true, Ordering::Release);
     let _ = tokio::task::spawn_blocking(move || video.join()).await;

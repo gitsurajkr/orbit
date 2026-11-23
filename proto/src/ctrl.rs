@@ -8,10 +8,23 @@ pub const HEADER_LEN: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ctrl {
-    /// C→S, first message.
-    ClientHello { version: u16 },
+    /// C→S, first message. `name` is the viewer PC's name, for the sharing PC's device list.
+    ClientHello { version: u16, name: String },
     /// S→C, reply to hello: the captured monitor's size and the capture rate cap.
     ServerHello { version: u16, width: u16, height: u16, fps: u16 },
+    /// S→C, instead of [`Ctrl::ServerHello`]: this viewer isn't on the sharing PC's device list.
+    /// With `code_active` the viewer may answer with [`Ctrl::PairStart`] (6-digit code);
+    /// otherwise the sharing PC first has to show a code.
+    PairRequired { code_active: bool },
+    /// C→S: first SPAKE2 message of the code check (see `auth::pake`).
+    PairStart { msg: Vec<u8> },
+    /// S→C: SPAKE2 answer.
+    PairReply { msg: Vec<u8> },
+    /// Both ways: proof of knowing the code (viewer first; the sharing PC answers only if the
+    /// viewer's proof was right).
+    PairProof { proof: Vec<u8> },
+    /// S→C: connection refused, with the reason to show. The connection closes after it.
+    Denied { reason: String },
     /// C→S. Sent repeatedly (rate-limited) until a keyframe actually arrives.
     KeyframeRequest,
     /// C→S. `scan` is the hardware scan code, so it's independent of keyboard layout.
@@ -83,6 +96,22 @@ mod tag {
     pub const PONG: u8 = 8;
     pub const CURSOR: u8 = 9;
     pub const CURSOR_IMAGE: u8 = 10;
+    pub const PAIR_REQUIRED: u8 = 11;
+    pub const PAIR_START: u8 = 12;
+    pub const PAIR_REPLY: u8 = 13;
+    pub const PAIR_PROOF: u8 = 14;
+    pub const DENIED: u8 = 15;
+}
+
+/// Longest name / reason text carried (bytes, cut at a character boundary).
+const MAX_TEXT: usize = 200;
+
+fn put_text(out: &mut Vec<u8>, s: &str) {
+    let mut end = s.len().min(MAX_TEXT);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.extend_from_slice(&s.as_bytes()[..end]);
 }
 
 impl Ctrl {
@@ -104,9 +133,30 @@ impl Ctrl {
                 out.extend_from_slice(bgra);
                 tag::CURSOR_IMAGE
             }
-            Ctrl::ClientHello { version } => {
+            Ctrl::ClientHello { version, ref name } => {
                 out.extend_from_slice(&version.to_le_bytes());
+                put_text(out, name);
                 tag::CLIENT_HELLO
+            }
+            Ctrl::PairRequired { code_active } => {
+                out.push(code_active as u8);
+                tag::PAIR_REQUIRED
+            }
+            Ctrl::PairStart { ref msg } => {
+                out.extend_from_slice(msg);
+                tag::PAIR_START
+            }
+            Ctrl::PairReply { ref msg } => {
+                out.extend_from_slice(msg);
+                tag::PAIR_REPLY
+            }
+            Ctrl::PairProof { ref proof } => {
+                out.extend_from_slice(proof);
+                tag::PAIR_PROOF
+            }
+            Ctrl::Denied { ref reason } => {
+                put_text(out, reason);
+                tag::DENIED
             }
             Ctrl::ServerHello { version, width, height, fps } => {
                 for v in [version, width, height, fps] {
@@ -161,8 +211,18 @@ impl Ctrl {
         Ok(match tag {
             tag::CLIENT_HELLO => {
                 need(2)?;
-                Ctrl::ClientHello { version: u16_at(0) }
+                // v2 clients send only the version; the name is then empty (and the version
+                // check refuses them anyway).
+                Ctrl::ClientHello { version: u16_at(0), name: String::from_utf8_lossy(&b[2..b.len().min(2 + MAX_TEXT)]).into_owned() }
             }
+            tag::PAIR_REQUIRED => {
+                need(1)?;
+                Ctrl::PairRequired { code_active: b[0] != 0 }
+            }
+            tag::PAIR_START => Ctrl::PairStart { msg: b.to_vec() },
+            tag::PAIR_REPLY => Ctrl::PairReply { msg: b.to_vec() },
+            tag::PAIR_PROOF => Ctrl::PairProof { proof: b.to_vec() },
+            tag::DENIED => Ctrl::Denied { reason: String::from_utf8_lossy(&b[..b.len().min(MAX_TEXT)]).into_owned() },
             tag::SERVER_HELLO => {
                 need(8)?;
                 Ctrl::ServerHello { version: u16_at(0), width: u16_at(2), height: u16_at(4), fps: u16_at(6) }
@@ -245,7 +305,13 @@ mod tests {
     #[test]
     fn every_message_round_trips() {
         let all = [
-            Ctrl::ClientHello { version: 1 },
+            Ctrl::ClientHello { version: 1, name: "LAPTOP-NOVA".into() },
+            Ctrl::ClientHello { version: 1, name: String::new() },
+            Ctrl::PairRequired { code_active: true },
+            Ctrl::PairStart { msg: vec![1, 2, 3] },
+            Ctrl::PairReply { msg: vec![4; 33] },
+            Ctrl::PairProof { proof: vec![5; 32] },
+            Ctrl::Denied { reason: "not paired · ✓".into() },
             Ctrl::ServerHello { version: 1, width: 2560, height: 1440, fps: 120 },
             Ctrl::KeyframeRequest,
             Ctrl::Key { scan: 0x1d, extended: true, down: false },
@@ -278,6 +344,16 @@ mod tests {
         // image shorter than width*height*4, or bigger than the limit
         assert!(Ctrl::decode(tag::CURSOR_IMAGE, &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 1]).is_err());
         assert!(Ctrl::decode(tag::CURSOR_IMAGE, &[0, 0, 0, 0, 0, 0, 0, 0, 200, 0, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn long_text_is_cut_at_a_character_boundary() {
+        let mut buf = Vec::new();
+        Ctrl::Denied { reason: "é".repeat(150) }.encode(&mut buf);
+        let (t, len) = Ctrl::parse_header(buf[..HEADER_LEN].try_into().unwrap());
+        assert!(len <= MAX_TEXT);
+        let Ctrl::Denied { reason } = Ctrl::decode(t, &buf[HEADER_LEN..]).unwrap() else { panic!() };
+        assert_eq!(reason, "é".repeat(100));
     }
 
     #[test]

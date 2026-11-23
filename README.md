@@ -135,13 +135,20 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 
 ## Security
 
-> [!IMPORTANT]
-> ORBIT relies on **Tailscale** for security today.
+Two locks, one inside the other:
 
-- Traffic is encrypted end to end by Tailscale's WireGuard tunnel (and by QUIC's TLS 1.3 on top).
-- ORBIT accepts connections **only from Tailscale addresses** (100.64.0.0/10, fd7a:115c:a1e0::/48). Anything from your LAN or the internet is refused.
-- There is **no pairing or password yet**, and the viewer doesn't verify the server's certificate. Anyone on your tailnet can connect, so use [Tailscale ACLs](https://tailscale.com/kb/1018/acls) to choose who can reach port 9000.
-- Never forward UDP port 9000 on your router.
+1. **Tailscale.** ORBIT accepts connections **only from Tailscale addresses** (100.64.0.0/10, fd7a:115c:a1e0::/48); anything from your LAN or the internet is refused. Traffic is encrypted by Tailscale's WireGuard tunnel, and by QUIC's TLS 1.3 on top.
+2. **Pairing.** Every ORBIT install has its own ID certificate (its private key is encrypted with Windows DPAPI). The sharing PC lets in only devices on its **PAIRED DEVICES** list. Nothing is captured or controlled before that check.
+
+How a device gets on the list, once:
+
+- **Your own devices** (logged into the same Tailscale account as the sharing PC) pair themselves on their first connection. Turn this off in PAIRED DEVICES if other people use your Tailscale account.
+- **Anyone else** needs a 6-digit code: on the sharing PC, SHARE → PAIRED DEVICES → **PAIR A NEW DEVICE**. The code is valid for 5 minutes and 5 tries, and is checked with SPAKE2, so it never travels over the network and can't be guessed offline.
+
+**REMOVE** in PAIRED DEVICES ends that device's session at once. The viewer also remembers each PC's ID: if a different one answers at the same address, ORBIT warns before connecting (like SSH).
+
+> [!TIP]
+> Never forward UDP port 9000 on your router. You can also limit who reaches port 9000 with [Tailscale ACLs](https://tailscale.com/kb/1018/acls).
 
 ## Known limits
 
@@ -156,7 +163,6 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 
 - [ ] NVENC reference-frame invalidation: recover from heavy loss without a keyframe
 - [ ] Lower resolution automatically on very slow links
-- [ ] Pairing with a PIN and certificate pinning
 - [ ] Clipboard sync and multi-monitor switching
 - [ ] Lock screen and UAC capture (Windows service)
 
@@ -175,10 +181,12 @@ cargo build --release
 orbit-server --list                   # monitors and which GPU drives each
 orbit-server --fps 120 --mbps 30      # share on UDP 9000 (Tailscale peers only)
 orbit-server --bench --dump out.h264  # capture + encode only, no network
+orbit-server --pair                   # also show a pairing code for a new device
 orbit-client 100.x.y.z --view-only
+orbit-client 100.x.y.z --code 123456  # first connection from another Tailscale account
 ```
 
-Settings and recent addresses are stored in `%APPDATA%\ORBIT\orbit.cfg`.
+Settings and recent addresses are stored in `%APPDATA%\ORBIT\orbit.cfg`; the ID certificate in `identity.bin`, paired devices in `trusted.json` and known PCs in `known_pcs.json` next to it.
 
 ## License
 

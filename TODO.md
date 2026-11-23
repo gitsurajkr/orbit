@@ -24,7 +24,7 @@
 - [x] Adaptive bitrate (milestone 4): server/src/rate.rs, from RTT, loss and net wait.
 - [ ] Tune adaptive bitrate on the real relayed link (recovery after a deep cut is slow).
 - [ ] Share the lock screen / UAC prompts (needs a Windows service running as SYSTEM).
-- [ ] Pairing / auth (milestone 5): PIN on first connect, verify the server certificate.
+- [x] Pairing / auth (milestone 5): ID certificates, paired-device list, own-account auto-pair, 6-digit code (SPAKE2), known-PC check.
 - [ ] Clipboard sync.
 - [ ] Multi-monitor switching from the viewer.
 - [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).

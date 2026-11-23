@@ -1,8 +1,9 @@
 //! QUIC endpoint setup.
 //!
-//! TLS: a fresh self-signed certificate each run, and the client doesn't verify it yet.
-//! Tailscale (WireGuard) already encrypts and authenticates which devices can reach this port;
-//! ORBIT's own pairing comes in the auth milestone.
+//! TLS 1.3 with this PC's permanent certificate (its "ID card", see the `auth` crate). Viewers
+//! show theirs too; any certificate is accepted *here*, so an unpaired viewer can finish the
+//! handshake and be told to pair. Whether it's allowed in is decided afterwards by its
+//! certificate's fingerprint (session.rs). TLS has already proven it holds that certificate's key.
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -33,13 +34,54 @@ pub fn transport() -> quinn::TransportConfig {
     t
 }
 
-pub fn endpoint(bind: SocketAddr) -> Result<quinn::Endpoint> {
-    let cert = rcgen::generate_simple_self_signed(vec!["orbit".to_string()])?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+/// Asks every viewer for its certificate and checks that it holds the matching key (the TLS
+/// signature checks below), but doesn't judge *which* certificate it is: that's the device list.
+#[derive(Debug)]
+struct AnyViewer(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::server::danger::ClientCertVerifier for AnyViewer {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        false // a viewer without one is refused after the hello, with a readable reason
+    }
+    fn verify_client_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+pub fn endpoint(bind: SocketAddr, id: &auth::Identity) -> Result<quinn::Endpoint> {
+    let cert_der = rustls::pki_types::CertificateDer::from(id.cert_der.clone());
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(id.key_der.clone());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AnyViewer(provider)))
         .with_single_cert(vec![cert_der], key_der.into())?;
     tls.alpn_protocols = vec![proto::ALPN.to_vec()];
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));

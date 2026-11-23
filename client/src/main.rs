@@ -8,11 +8,19 @@ struct Args {
     /// Watch only: don't send mouse or keyboard to the server.
     #[arg(long)]
     view_only: bool,
+    /// The 6-digit pairing code shown on the server (first connection from a device on another
+    /// Tailscale account).
+    #[arg(long)]
+    code: Option<String>,
+    /// Connect even though the server's ID changed since last time (e.g. ORBIT was reinstalled).
+    #[arg(long)]
+    accept_new_identity: bool,
 }
 
 fn main() {
     let args = Args::parse();
-    if let Err(e) = client::run_viewer(&args.server, args.view_only) {
+    let opts = client::ConnectOptions { code: args.code, accept_new_identity: args.accept_new_identity };
+    if let Err(e) = client::run_viewer(&args.server, args.view_only, &opts) {
         eprintln!("orbit-client: {e:#}");
         std::process::exit(1);
     }

@@ -30,6 +30,13 @@ struct Args {
     /// Address to listen on. Default 0.0.0.0:9000; only Tailscale (and loopback) peers are accepted.
     #[arg(long)]
     bind: Option<std::net::SocketAddr>,
+    /// Show a 6-digit pairing code (valid 5 minutes) for a viewer that isn't paired yet.
+    #[arg(long)]
+    pair: bool,
+    /// Devices on this PC's Tailscale account: "on" lets them in without a code (default,
+    /// remembered), "off" requires a code from them too.
+    #[arg(long, value_parser = ["on", "off"])]
+    trust_own_account: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -52,10 +59,24 @@ fn main() -> Result<()> {
         Some(ip) => println!("this PC's Tailscale IP: {ip} (type it on the other PC)"),
         None => println!("Tailscale isn't connected yet; ORBIT accepts connections as soon as it is"),
     }
-    let settings = session::Settings { monitor: mon.clone(), fps: args.fps, bitrate_bps: (args.mbps * 1e6) as u32 };
+    let identity = auth::Identity::load_or_create()?;
+    let gate = auth::Gate::load();
+    if let Some(v) = &args.trust_own_account {
+        gate.set_trust_own_account(v == "on");
+    }
+    println!(
+        "this PC's ID: {} | {} paired device(s) | own Tailscale account: {}",
+        auth::short(&identity.fingerprint()),
+        gate.devices().len(),
+        if gate.trust_own_account() { "let in without a code" } else { "needs a code" }
+    );
+    if args.pair {
+        println!("pairing code: {}  (type it on the other PC within 5 minutes)", gate.start_pin());
+    }
+    let settings = session::Settings { monitor: mon.clone(), fps: args.fps, bitrate_bps: (args.mbps * 1e6) as u32, identity, gate };
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     rt.block_on(async {
-        let endpoint = net::endpoint(bind)?;
+        let endpoint = net::endpoint(bind, &settings.identity)?;
         println!(
             "orbit-server listening on {bind} | {} {}x{} on '{}' | {} fps cap | {} Mbit/s",
             mon.device_name, mon.width, mon.height, mon.adapter_name, args.fps, args.mbps

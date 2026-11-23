@@ -1,4 +1,4 @@
-//! Client networking (tokio): connect, handshake, then three tasks:
+//! Client networking (tokio): connect, check who answered, get let in (pairing), then three tasks:
 //! - datagrams: reassemble video frames, gate deltas after a loss, request keyframes
 //! - ctrl writer: keys/buttons/wheel/keyframe requests from the window, plus clock pings
 //! - ctrl reader: pongs → clock sync, pointer shapes → window thread
@@ -61,6 +61,45 @@ pub struct Session {
 /// How long a partly received frame may wait for its missing fragments.
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(80);
 
+/// Why the sharing PC didn't let us in, for the app to react to (ask for a code, warn).
+#[derive(Debug)]
+pub enum AuthError {
+    /// Not paired. `code_active`: a code is showing on the sharing PC right now.
+    NeedCode { code_active: bool },
+    /// Refused, with the sharing PC's reason (e.g. wrong code).
+    Denied(String),
+    /// A different certificate than last time answers at this address.
+    IdentityChanged { addr: String, expected: String, got: String },
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            AuthError::NeedCode { code_active: true } => write!(f, "not paired yet: type the 6-digit code shown on the other PC"),
+            AuthError::NeedCode { code_active: false } => {
+                write!(f, "not paired yet: on the other PC open ORBIT > SHARE > PAIR NEW DEVICE, then connect again and type the code it shows")
+            }
+            AuthError::Denied(r) => write!(f, "refused: {r}"),
+            AuthError::IdentityChanged { addr, expected, got } => write!(
+                f,
+                "the PC at {addr} has a different ID than last time (now {got}, was {expected}). Expected if ORBIT was reinstalled there; otherwise don't connect"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+/// How to connect: the pairing code, if the user typed one, and whether a changed ID was
+/// accepted by the user.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectOptions {
+    pub code: Option<String>,
+    pub accept_new_identity: bool,
+}
+
+/// Accepts any server certificate *during* the handshake (TLS still checks the server holds
+/// its key); which certificate it is gets checked right after, against the known PCs.
 #[derive(Debug)]
 struct SkipVerify(Arc<rustls::crypto::CryptoProvider>);
 
@@ -73,7 +112,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
         _: &[u8],
         _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // v1: Tailscale authenticates the peer device; ORBIT pairing comes later.
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -97,13 +135,15 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     }
 }
 
-fn client_config() -> Result<quinn::ClientConfig> {
+fn client_config(id: &auth::Identity) -> Result<quinn::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = rustls::pki_types::CertificateDer::from(id.cert_der.clone());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(id.key_der.clone());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify(provider)))
-        .with_no_client_auth();
+        .with_client_auth_cert(vec![cert], key.into())?;
     tls.alpn_protocols = vec![proto::ALPN.to_vec()];
     let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     let mut t = quinn::TransportConfig::default();
@@ -128,6 +168,26 @@ async fn read_ctrl(r: &mut RecvStream) -> Result<Ctrl> {
     Ctrl::decode(tag, &body)
 }
 
+/// The pairing code check, viewer side (see `auth::pake`). Errors if the code is wrong.
+async fn pair_with_code(send: &mut SendStream, recv: &mut RecvStream, code: &str, my_fp: &auth::Fingerprint, server_fp: &auth::Fingerprint) -> Result<()> {
+    let (state, msg) = auth::pake::start(code, my_fp, server_fp);
+    write_ctrl(send, &Ctrl::PairStart { msg }).await?;
+    let reply = match read_ctrl(recv).await? {
+        Ctrl::PairReply { msg } => msg,
+        Ctrl::Denied { reason } => return Err(AuthError::Denied(reason).into()),
+        other => bail!("expected a pairing reply, got {other:?}"),
+    };
+    let key = state.finish(&reply)?;
+    write_ctrl(send, &Ctrl::PairProof { proof: key.proof_from_viewer().to_vec() }).await?;
+    match read_ctrl(recv).await? {
+        Ctrl::PairProof { proof } if key.check_sharer(&proof) => Ok(()),
+        // Only a fake sharing PC that doesn't know the code gets here.
+        Ctrl::PairProof { .. } => Err(AuthError::Denied("the other PC couldn't prove it knows the code".into()).into()),
+        Ctrl::Denied { reason } => Err(AuthError::Denied(reason).into()),
+        other => bail!("expected a pairing proof, got {other:?}"),
+    }
+}
+
 async fn write_ctrl(w: &mut SendStream, c: &Ctrl) -> Result<()> {
     let mut buf = Vec::with_capacity(32);
     c.encode(&mut buf);
@@ -135,22 +195,64 @@ async fn write_ctrl(w: &mut SendStream, c: &Ctrl) -> Result<()> {
     Ok(())
 }
 
-pub async fn connect(server: SocketAddr, frames_tx: mpsc::Sender<Frame>, wake: WakeEvent) -> Result<Session> {
+pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc::Sender<Frame>, wake: WakeEvent) -> Result<Session> {
+    let id = auth::Identity::load_or_create().context("this PC's ID certificate")?;
     let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse()? } else { "[::]:0".parse()? };
     let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(client_config()?);
+    endpoint.set_default_client_config(client_config(&id)?);
     let conn = tokio::time::timeout(Duration::from_secs(5), endpoint.connect(server, "orbit")?)
         .await
         .with_context(|| format!("no answer from {server} (is ORBIT sharing on that PC and reachable over Tailscale?)"))??;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_ctrl(&mut send, &Ctrl::ClientHello { version: proto::VERSION }).await?;
-    let (width, height, fps) = match tokio::time::timeout(Duration::from_secs(5), read_ctrl(&mut recv)).await.context("no hello from server")?? {
-        Ctrl::ServerHello { version, width, height, fps } => {
-            ensure!(version == proto::VERSION, "server protocol {version}, client {}", proto::VERSION);
-            (width as u32, height as u32, fps as u32)
+
+    // Is this the same PC as last time at this address?
+    let server_fp = conn
+        .peer_identity()
+        .and_then(|a| a.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+        .and_then(|c| c.first().map(|c| auth::fingerprint(c)))
+        .context("the other PC sent no certificate")?;
+    let addr_key = server.ip().to_canonical().to_string();
+    let mut known = auth::KnownPcs::load();
+    if let auth::Check::Changed { expected } = known.check(&addr_key, &server_fp) {
+        if !opts.accept_new_identity {
+            conn.close(0u32.into(), b"identity changed");
+            return Err(AuthError::IdentityChanged { addr: addr_key, expected: auth::short(&expected), got: auth::short(&server_fp) }.into());
         }
-        other => bail!("expected hello, got {other:?}"),
+    }
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_ctrl(&mut send, &Ctrl::ClientHello { version: proto::VERSION, name: auth::device_name() }).await?;
+    let hello = async {
+        let mut paired = false;
+        loop {
+            match read_ctrl(&mut recv).await? {
+                Ctrl::ServerHello { version, width, height, fps } => {
+                    ensure!(version == proto::VERSION, "server protocol {version}, client {}", proto::VERSION);
+                    return Ok((width as u32, height as u32, fps as u32));
+                }
+                Ctrl::PairRequired { code_active } => match (&opts.code, code_active, paired) {
+                    (Some(code), true, false) => {
+                        pair_with_code(&mut send, &mut recv, code, &id.fingerprint(), &server_fp).await?;
+                        paired = true;
+                    }
+                    _ => return Err(AuthError::NeedCode { code_active }.into()),
+                },
+                Ctrl::Denied { reason } => return Err(AuthError::Denied(reason).into()),
+                other => bail!("expected hello, got {other:?}"),
+            }
+        }
     };
+    let hello: Result<(u32, u32, u32)> = tokio::time::timeout(Duration::from_secs(20), hello).await.context("no hello from server")?;
+    let (width, height, fps) = match hello {
+        Ok(h) => h,
+        Err(e) => {
+            conn.close(0u32.into(), b"not let in");
+            return Err(e);
+        }
+    };
+    // Let in: remember this PC's ID for next time.
+    if let Err(e) = known.remember(&addr_key, &server_fp) {
+        eprintln!("couldn't save known PCs: {e:#}");
+    }
 
     let clock = Arc::new(Mutex::new(ClockSync::default()));
     let stats = Arc::new(NetStats::default());

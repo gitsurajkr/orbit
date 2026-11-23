@@ -47,7 +47,7 @@ thread_local! {
 
 /// Connects to `server` (IP or name, optional `:port`) and runs the viewer window until it's
 /// closed or the connection ends.
-pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
+pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> Result<()> {
     let server = server.trim();
     let addr_str = if server.contains(':') { server.to_string() } else { format!("{server}:{}", proto::DEFAULT_PORT) };
     let server = addr_str
@@ -66,7 +66,7 @@ pub fn run_viewer(server: &str, view_only: bool) -> Result<()> {
     let (frames_tx, frames_rx) = mpsc::channel::<Frame>();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     println!("connecting to {server} ...");
-    let session = rt.block_on(net::connect(server, frames_tx, wake))?;
+    let session = rt.block_on(net::connect(server, opts, frames_tx, wake))?;
     println!("connected: remote screen {}x{} @ {} fps cap", session.width, session.height, session.fps);
 
     let hwnd = create_window(session.width, session.height)?;
