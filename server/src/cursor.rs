@@ -2,8 +2,8 @@
 //!
 //! The video never contains the pointer (Desktop Duplication leaves it out), and the viewer
 //! uses its local pointer so it moves with zero lag. What's missing is only the *shape*: the
-//! I-beam over text, resize arrows on window edges, the hand over links, a hidden pointer
-//! during video playback.
+//! I-beam over text, resize arrows on window edges, the hand over links. (A pointer the remote
+//! PC hides keeps its last shape here: see `poll`.)
 //!
 //! [`CursorWatch::poll`] reads `GetCursorInfo` (cheap; called every ~16 ms) and only produces a
 //! message when the shape changed:
@@ -48,20 +48,20 @@ impl CursorWatch {
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             return; // e.g. the secure desktop is up; keep the last shape
         }
-        // With no mouse plugged in, Windows reports the pointer as hidden all the time; ignore
-        // that, or the viewer's pointer would vanish for good.
-        let mouse_present = unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0;
-        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 || !mouse_present;
+        // A pointer Windows reports as hidden keeps its last shape in the viewer: the viewer's
+        // pointer is never hidden. Windows hides its cursor whenever no mouse is plugged in (a
+        // PC controlled remotely often has none), and SM_MOUSEPRESENT can't tell (virtual mouse
+        // drivers make it almost always 1), so hiding it made the pointer vanish for good.
+        let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0;
         let h = ci.hCursor.0 as isize;
+        if !showing || h == 0 {
+            return;
+        }
         let state = (h, showing);
         if self.last == Some(state) {
             return;
         }
         self.last = Some(state);
-        if !showing || h == 0 {
-            out.push(Ctrl::Cursor { kind: cursor::HIDDEN, key: 0 });
-            return;
-        }
         if let Some(&(_, kind)) = self.standard.iter().find(|(sh, _)| *sh == h) {
             out.push(Ctrl::Cursor { kind, key: 0 });
             return;

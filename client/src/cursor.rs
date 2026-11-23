@@ -33,7 +33,9 @@ impl Cursors {
                 }
                 None
             }
-            Ctrl::Cursor { kind: cursor::HIDDEN, .. } => Some(HCURSOR::default()),
+            // Never hide the pointer: older ORBIT versions sent "hidden" whenever the remote PC
+            // had no mouse plugged in, which made the pointer vanish. Keep the last shape.
+            Ctrl::Cursor { kind: cursor::HIDDEN, .. } => None,
             Ctrl::Cursor { kind: cursor::CUSTOM, key } => Some(self.custom.get(&key).copied().unwrap_or_else(arrow)),
             Ctrl::Cursor { kind, .. } => {
                 let id = cursor::STANDARD.get(kind as usize - 1).copied().unwrap_or(cursor::STANDARD[0]);
@@ -119,7 +121,7 @@ mod tests {
         let custom = c.handle(Ctrl::Cursor { kind: cursor::CUSTOM, key: 7 }).unwrap();
         assert!(!custom.is_invalid() && custom != arrow());
         assert_eq!(c.handle(Ctrl::Cursor { kind: cursor::CUSTOM, key: 8 }), Some(arrow()), "unknown key");
-        assert_eq!(c.handle(Ctrl::Cursor { kind: cursor::HIDDEN, key: 0 }), Some(HCURSOR::default()));
+        assert_eq!(c.handle(Ctrl::Cursor { kind: cursor::HIDDEN, key: 0 }), None, "never hides the pointer");
         assert_eq!(c.handle(Ctrl::Cursor { kind: 2, key: 0 }), Some(unsafe { LoadCursorW(None, IDC_IBEAM) }.unwrap()));
         assert_eq!(c.handle(Ctrl::Cursor { kind: 200, key: 0 }), Some(arrow()), "unknown kind");
     }
