@@ -119,7 +119,7 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
     let mut ticker = Ticker::new(Duration::from_secs(1));
     let mut presented = 0u64;
     let (mut latency, mut decode_ms, mut wire_ms) = (Dist::default(), Dist::default(), Dist::default());
-    let mut prev = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut prev = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let path = proto::tailscale::PathWatcher::start(server.ip());
 
     'main: loop {
@@ -198,10 +198,11 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
                 st.skipped.load(Ordering::Relaxed),
                 st.keyframe_requests.load(Ordering::Relaxed),
                 st.recovered.load(Ordering::Relaxed),
+                st.invalidations.load(Ordering::Relaxed),
             );
             let rtt = session.clock.lock().unwrap().last_rtt_us().map_or(f64::NAN, |r| r as f64 / 1e3);
             let line = format!(
-                "fps {:5.1} (recv {:5.1}) | {:6.2} Mbit/s | latency ms {}{} | decode ms {} | frame spread ms {} | rtt {:.1} | lost {} skip {} keyreq {} fec-fixed {}",
+                "fps {:5.1} (recv {:5.1}) | {:6.2} Mbit/s | latency ms {}{} | decode ms {} | frame spread ms {} | rtt {:.1} | lost {} skip {} keyreq {} repair-req {} fec-fixed {}",
                 presented as f64 / secs,
                 (now.1 - prev.1) as f64 / secs,
                 mbit_per_s(now.0 - prev.0, secs),
@@ -213,6 +214,7 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
                 now.2 - prev.2,
                 now.3 - prev.3,
                 now.4 - prev.4,
+                now.6 - prev.6,
                 now.5 - prev.5,
             );
             println!("{line}");

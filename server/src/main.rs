@@ -101,7 +101,7 @@ fn bench(args: &Args, mon: capture::MonitorInfo) -> Result<()> {
     loop {
         let started = Instant::now();
         buf.clear();
-        if let Some(e) = p.next(100, first, &mut buf)? {
+        if let Some(e) = p.next(100, first, false, &mut buf)? {
             first = false;
             frames += 1;
             bytes += buf.len() as u64;

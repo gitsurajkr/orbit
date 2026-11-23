@@ -9,24 +9,29 @@
 //! u16 shard_index   // 0..data_count are data, data_count.. are parity
 //! u16 data_count
 //! u16 parity_count
-//! u8  flags         // bit 0: keyframe (IDR)
+//! u8  flags         // bit 0: keyframe (IDR), bit 1: recovery frame
 //! u64 capture_us    // server's clock when the screen was captured (see clock.rs)
 //! u32 frame_len     // bytes of real data (the last data shard is zero-padded)
+//! u32 recovery_for  // recovery frames: the first lost frame they repair (else 0)
 //! [shard]
 //! ```
 //!
 //! FEC: the client rebuilds the frame from **any** `data_count` of the shards, so up to
 //! `parity_count` lost datagrams per frame cost nothing. Data shards go first, so with no loss
 //! the frame completes before its parity arrives (no added delay). A frame that loses more than
-//! that is dropped whole, the client asks for a keyframe, and deltas are skipped until it
-//! arrives ([`KeyframeGate`]). No retransmission.
+//! that is dropped whole and deltas are skipped until the picture is repaired
+//! ([`KeyframeGate`]): preferably by a **recovery frame** (the client reports the lost frame,
+//! the encoder invalidates it and everything sent after it, and encodes the next frame from an
+//! older picture the client still has: about the size of a normal frame), else by a keyframe.
+//! No retransmission.
 
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub const HEADER_LEN: usize = 24;
+pub const HEADER_LEN: usize = 28;
 pub const FLAG_KEYFRAME: u8 = 1;
+pub const FLAG_RECOVERY: u8 = 2;
 /// reed-solomon-simd's limit on data shards per frame.
 const MAX_DATA_SHARDS: usize = 32768;
 
@@ -39,6 +44,7 @@ pub struct FragHeader {
     pub flags: u8,
     pub capture_us: u64,
     pub frame_len: u32,
+    pub recovery_for: u32,
 }
 
 impl FragHeader {
@@ -51,6 +57,7 @@ impl FragHeader {
         out.push(self.flags);
         out.extend_from_slice(&self.capture_us.to_le_bytes());
         out.extend_from_slice(&self.frame_len.to_le_bytes());
+        out.extend_from_slice(&self.recovery_for.to_le_bytes());
     }
 
     pub fn parse(b: &[u8]) -> Result<(FragHeader, &[u8])> {
@@ -64,6 +71,7 @@ impl FragHeader {
             flags: b[11],
             capture_us: u64::from_le_bytes(b[12..20].try_into().unwrap()),
             frame_len: u32::from_le_bytes(b[20..24].try_into().unwrap()),
+            recovery_for: u32::from_le_bytes(b[24..28].try_into().unwrap()),
         };
         let total = h.data_count as usize + h.parity_count as usize;
         ensure!(h.data_count > 0 && h.data_count as usize <= MAX_DATA_SHARDS && h.parity_count > 0, "bad shard counts");
@@ -99,7 +107,8 @@ pub fn datagram_count(len: usize, max_datagram: usize, fec_percent: u32) -> usiz
 }
 
 /// Splits one encoded frame into data + parity datagrams of at most `max_datagram` bytes.
-pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, data: &[u8], max_datagram: usize, fec_percent: u32) -> Result<Vec<Vec<u8>>> {
+/// `recovery_for`: this frame repairs the loss that started at that frame id.
+pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, recovery_for: Option<u32>, data: &[u8], max_datagram: usize, fec_percent: u32) -> Result<Vec<Vec<u8>>> {
     ensure!(max_datagram > HEADER_LEN + 64, "datagram size {max_datagram} too small");
     let k = data_count(data.len(), max_datagram);
     let m = parity_count(k, fec_percent);
@@ -114,11 +123,12 @@ pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, data: &[u8], max
         })
         .collect();
     let parity = reed_solomon_simd::encode(k, m, &shards).context("FEC encode")?;
-    let flags = if keyframe { FLAG_KEYFRAME } else { 0 };
+    let flags = if keyframe { FLAG_KEYFRAME } else { 0 } | if recovery_for.is_some() { FLAG_RECOVERY } else { 0 };
     let mut out = Vec::with_capacity(k + m);
     for (i, shard) in shards.iter().chain(parity.iter()).enumerate() {
         let mut d = Vec::with_capacity(HEADER_LEN + shard_len);
-        FragHeader { frame_id, shard_index: i as u16, data_count: k as u16, parity_count: m as u16, flags, capture_us, frame_len: data.len() as u32 }.write(&mut d);
+        FragHeader { frame_id, shard_index: i as u16, data_count: k as u16, parity_count: m as u16, flags, capture_us, frame_len: data.len() as u32, recovery_for: recovery_for.unwrap_or(0) }
+            .write(&mut d);
         d.extend_from_slice(shard);
         out.push(d);
     }
@@ -130,6 +140,8 @@ pub fn fragment(frame_id: u32, capture_us: u64, keyframe: bool, data: &[u8], max
 pub struct Frame {
     pub id: u32,
     pub keyframe: bool,
+    /// Recovery frame: repairs the loss that started at this frame id.
+    pub recovery_for: Option<u32>,
     pub capture_us: u64,
     pub data: Vec<u8>,
     /// True if FEC rebuilt missing data shards (the frame would have been lost without it).
@@ -149,6 +161,7 @@ pub enum Event {
 
 struct Partial {
     keyframe: bool,
+    recovery_for: Option<u32>,
     capture_us: u64,
     frame_len: usize,
     data_count: usize,
@@ -212,6 +225,7 @@ impl Reassembler {
         let (k, m) = (h.data_count as usize, h.parity_count as usize);
         let p = self.partial.entry(h.frame_id).or_insert_with(|| Partial {
             keyframe: h.flags & FLAG_KEYFRAME != 0,
+            recovery_for: (h.flags & FLAG_RECOVERY != 0).then_some(h.recovery_for),
             capture_us: h.capture_us,
             frame_len: h.frame_len as usize,
             data_count: k,
@@ -240,11 +254,11 @@ impl Reassembler {
             if let Some(prev) = h.frame_id.checked_sub(1) {
                 self.give_up_through(prev, out);
             }
-            let (keyframe, capture_us, first_at) = (p.keyframe, p.capture_us, p.first_at);
+            let (keyframe, recovery_for, capture_us, first_at) = (p.keyframe, p.recovery_for, p.capture_us, p.first_at);
             match p.assemble() {
                 Ok((data, recovered)) => {
                     self.done_through = Some(h.frame_id);
-                    out.push(Event::Frame(Frame { id: h.frame_id, keyframe, capture_us, data, recovered, first_at, complete_at: now }));
+                    out.push(Event::Frame(Frame { id: h.frame_id, keyframe, recovery_for, capture_us, data, recovered, first_at, complete_at: now }));
                 }
                 Err(_) => self.give_up_through(h.frame_id, out),
             }
@@ -285,15 +299,36 @@ impl Reassembler {
     }
 }
 
-/// Decides which frames may go to the decoder and when to ask for a keyframe.
+/// Decides which frames may go to the decoder, and what to ask the server for after a loss.
 ///
-/// After any loss, H.264 deltas reference a picture the decoder never got, so they'd decode as
-/// garbage: skip them until a keyframe arrives. Keep asking (every `retry`, see
-/// [`keyframe_retry`]) until one does, so a lost request or lost keyframe can't freeze the
-/// picture forever.
+/// After a loss, H.264 deltas reference a picture the decoder never got, so they'd decode as
+/// garbage: skip them until the picture is repaired, by
+/// - a **recovery frame** for that loss: the server invalidated the lost frame and everything
+///   after it, so this frame only references pictures from before the loss, which the decoder
+///   has (asked for with [`Request::Invalidate`]);
+/// - or a **keyframe** (at the start, after a decoder error, or when recovery doesn't arrive
+///   after [`INVALIDATE_TRIES`] requests).
+///
+/// Keeps asking (every `retry`, see [`keyframe_retry`]) until repaired, so a lost recovery
+/// frame or keyframe can't freeze the picture.
 pub struct KeyframeGate {
     waiting: bool,
+    /// First frame the decoder didn't get in the current outage.
+    first_lost: Option<u32>,
+    /// Only a keyframe can repair the picture now.
+    need_keyframe: bool,
+    requests: u32,
     last_request: Option<Instant>,
+}
+
+/// Invalidation requests sent for one outage before asking for a keyframe instead.
+pub const INVALIDATE_TRIES: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    Keyframe,
+    /// Invalidate frame `from` and everything sent after it, then send a recovery frame.
+    Invalidate { from: u32 },
 }
 
 /// How long to wait for a requested keyframe before asking again: the request and the keyframe
@@ -312,29 +347,57 @@ impl Default for KeyframeGate {
 impl KeyframeGate {
     pub fn new() -> Self {
         // Waiting from the start: nothing decodes before the first keyframe.
-        KeyframeGate { waiting: true, last_request: None }
+        KeyframeGate { waiting: true, first_lost: None, need_keyframe: true, requests: 0, last_request: None }
     }
 
-    pub fn on_lost(&mut self) {
+    /// Frames from `from` on were lost.
+    pub fn on_lost(&mut self, from: u32) {
+        if !self.waiting {
+            self.waiting = true;
+            self.first_lost = Some(from);
+            self.requests = 0;
+            self.last_request = None;
+        }
+    }
+
+    /// The decoder failed: only a keyframe helps.
+    pub fn on_decode_error(&mut self) {
         self.waiting = true;
+        self.need_keyframe = true;
     }
 
     /// True if this frame should be decoded.
-    pub fn admit(&mut self, keyframe: bool) -> bool {
-        if keyframe {
+    pub fn admit(&mut self, keyframe: bool, recovery_for: Option<u32>) -> bool {
+        let repairs = match (recovery_for, self.first_lost) {
+            // It references only frames from before `r`; the decoder has all frames before
+            // `first_lost`, so any r <= first_lost is safe.
+            (Some(r), Some(lost)) => !self.need_keyframe && r.wrapping_sub(lost) as i32 <= 0,
+            _ => false,
+        };
+        if keyframe || (self.waiting && repairs) {
             self.waiting = false;
+            self.need_keyframe = false;
+            self.first_lost = None;
+            self.requests = 0;
             self.last_request = None;
         }
         !self.waiting
     }
 
-    /// True if a keyframe request should be sent now.
-    pub fn should_request(&mut self, now: Instant, retry: Duration) -> bool {
-        if self.waiting && self.last_request.is_none_or(|t| now.duration_since(t) >= retry) {
-            self.last_request = Some(now);
-            return true;
+    /// What to ask the server for now, if anything.
+    pub fn should_request(&mut self, now: Instant, retry: Duration) -> Option<Request> {
+        if !self.waiting || self.last_request.is_some_and(|t| now.duration_since(t) < retry) {
+            return None;
         }
-        false
+        self.last_request = Some(now);
+        self.requests += 1;
+        match self.first_lost {
+            Some(from) if !self.need_keyframe && self.requests <= INVALIDATE_TRIES => Some(Request::Invalidate { from }),
+            _ => {
+                self.need_keyframe = true;
+                Some(Request::Keyframe)
+            }
+        }
     }
 
     pub fn waiting(&self) -> bool {
@@ -351,7 +414,7 @@ mod tests {
 
     fn frame(id: u32, len: usize, key: bool) -> Vec<Vec<u8>> {
         let data: Vec<u8> = (0..len).map(|i| (i * 7 + id as usize) as u8).collect();
-        fragment(id, 1000 + id as u64, key, &data, MTU, FEC).unwrap()
+        fragment(id, 1000 + id as u64, key, None, &data, MTU, FEC).unwrap()
     }
 
     fn frames(ev: &[Event]) -> Vec<u32> {
@@ -366,7 +429,7 @@ mod tests {
     fn fragments_fit_and_rebuild_exactly() {
         for len in [0, 1, MTU - HEADER_LEN, MTU - HEADER_LEN + 1, 300_000] {
             let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
-            let grams = fragment(5, 42, true, &data, MTU, FEC).unwrap();
+            let grams = fragment(5, 42, true, None, &data, MTU, FEC).unwrap();
             assert_eq!(grams.len(), datagram_count(len, MTU, FEC));
             assert!(grams.iter().all(|g| g.len() <= MTU));
             let mut r = Reassembler::new(Duration::from_millis(100));
@@ -408,7 +471,7 @@ mod tests {
     #[test]
     fn fec_rebuilds_up_to_parity_count_lost_datagrams_anywhere() {
         let data: Vec<u8> = (0..30_001).map(|i| (i * 13) as u8).collect(); // odd length: padding
-        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let grams = fragment(0, 1, false, None, &data, MTU, FEC).unwrap();
         let k = data.len().div_ceil(shard_capacity(MTU));
         let m = grams.len() - k;
         assert_eq!(m, parity_count(k, FEC));
@@ -427,7 +490,7 @@ mod tests {
     #[test]
     fn too_many_lost_datagrams_lose_the_frame() {
         let data = vec![7u8; 30_000];
-        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let grams = fragment(0, 1, false, None, &data, MTU, FEC).unwrap();
         let k = data.len().div_ceil(shard_capacity(MTU));
         let m = grams.len() - k;
         let skip: Vec<usize> = (0..=m).collect(); // one more than parity can cover
@@ -437,7 +500,7 @@ mod tests {
     #[test]
     fn clean_frame_completes_before_its_parity() {
         let data = vec![1u8; 10_000];
-        let grams = fragment(0, 1, false, &data, MTU, FEC).unwrap();
+        let grams = fragment(0, 1, false, None, &data, MTU, FEC).unwrap();
         let k = data.len().div_ceil(shard_capacity(MTU));
         let mut r = Reassembler::new(Duration::from_secs(1));
         let mut ev = Vec::new();
@@ -527,16 +590,60 @@ mod tests {
         let mut g = KeyframeGate::new();
         let r = Duration::from_millis(100);
         let t = Instant::now();
-        assert!(!g.admit(false));
-        assert!(g.should_request(t, r));
-        assert!(!g.should_request(t + Duration::from_millis(50), r));
-        assert!(g.should_request(t + Duration::from_millis(100), r)); // lost request is retried
-        assert!(g.admit(true));
-        assert!(g.admit(false));
-        assert!(!g.should_request(t + Duration::from_secs(1), r));
-        g.on_lost();
-        assert!(!g.admit(false));
-        assert!(g.should_request(t + Duration::from_secs(1), r));
+        assert!(!g.admit(false, None));
+        assert_eq!(g.should_request(t, r), Some(Request::Keyframe), "nothing decoded yet: keyframe");
+        assert_eq!(g.should_request(t + Duration::from_millis(50), r), None);
+        assert_eq!(g.should_request(t + Duration::from_millis(100), r), Some(Request::Keyframe)); // retried
+        assert!(g.admit(true, None));
+        assert!(g.admit(false, None));
+        assert_eq!(g.should_request(t + Duration::from_secs(1), r), None);
+        g.on_decode_error();
+        assert!(!g.admit(false, None));
+        assert_eq!(g.should_request(t + Duration::from_secs(1), r), Some(Request::Keyframe));
+    }
+
+    #[test]
+    fn gate_prefers_a_recovery_frame_after_a_loss() {
+        let mut g = KeyframeGate::new();
+        let r = Duration::from_millis(100);
+        let t = Instant::now();
+        assert!(g.admit(true, None));
+        g.on_lost(10);
+        g.on_lost(12); // a second loss in the same outage keeps the first lost frame
+        assert!(!g.admit(false, None), "deltas after the loss are skipped");
+        assert_eq!(g.should_request(t, r), Some(Request::Invalidate { from: 10 }));
+        assert!(!g.admit(false, Some(11)), "a recovery for a later loss doesn't repair frame 10");
+        assert!(g.admit(false, Some(10)), "recovery for the loss opens the gate");
+        assert!(g.admit(false, None));
+        // An older recovery (references even earlier pictures) is fine too.
+        g.on_lost(20);
+        assert!(g.admit(false, Some(15)));
+    }
+
+    #[test]
+    fn gate_falls_back_to_a_keyframe() {
+        let mut g = KeyframeGate::new();
+        let r = Duration::from_millis(100);
+        let t = Instant::now();
+        assert!(g.admit(true, None));
+        g.on_lost(5);
+        for i in 0..INVALIDATE_TRIES {
+            assert_eq!(g.should_request(t + r * i, r), Some(Request::Invalidate { from: 5 }));
+        }
+        assert_eq!(g.should_request(t + r * INVALIDATE_TRIES, r), Some(Request::Keyframe));
+        assert!(!g.admit(false, Some(5)), "after asking for a keyframe, only a keyframe repairs");
+        assert!(g.admit(true, None));
+    }
+
+    #[test]
+    fn recovery_flag_and_id_travel() {
+        let mut rs = Reassembler::new(Duration::from_millis(80));
+        let mut ev = Vec::new();
+        for g in fragment(3, 9, false, Some(2), &[7u8; 3000], MTU, FEC).unwrap() {
+            rs.push(&g, Instant::now(), &mut ev).unwrap();
+        }
+        let Some(Event::Frame(f)) = ev.into_iter().last() else { panic!() };
+        assert_eq!((f.id, f.keyframe, f.recovery_for), (3, false, Some(2)));
     }
 
     #[test]

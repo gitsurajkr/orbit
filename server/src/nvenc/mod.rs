@@ -9,7 +9,10 @@
 //!   each frame's output depends only on the past.
 //! - **CBR with a one-frame VBV**: every frame is at most about bitrate/fps bits, so no frame
 //!   (even a keyframe) bursts onto the network and builds a queue.
-//! - **Infinite GOP**: keyframes are sent only at start and when the client asks (after a loss).
+//! - **Infinite GOP**: keyframes are sent only at start and when the client asks.
+//! - **Reference-frame invalidation**: the encoder keeps several past frames as references, so
+//!   after a loss the lost frames can be invalidated ([`Encoder::invalidate`]) and the next
+//!   frame predicted from an older one the client still has, instead of a keyframe.
 
 #[allow(clippy::all)]
 mod sys;
@@ -37,6 +40,7 @@ const MAP_VER: u32 = struct_ver(4);
 const BITSTREAM_BUFFER_VER: u32 = struct_ver(1);
 const PIC_PARAMS_VER: u32 = struct_ver(6) | (1 << 31);
 const LOCK_BITSTREAM_VER: u32 = struct_ver(1) | (1 << 31);
+const CAPS_PARAM_VER: u32 = struct_ver(1);
 
 const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
     GUID { Data1: d1, Data2: d2, Data3: d3, Data4: d4 }
@@ -69,6 +73,10 @@ pub struct Encoder {
     config: Box<NV_ENC_CONFIG>,
     cfg: EncoderConfig,
     frame_idx: u32,
+    /// Reference frames kept (how far back a loss can be repaired without a keyframe).
+    max_refs: u32,
+    /// The GPU supports reference-frame invalidation.
+    rfi: bool,
     _input: ID3D11Texture2D,
     _device: ID3D11Device,
 }
@@ -135,10 +143,13 @@ impl Encoder {
                 config: Box::new(zeroed()),
                 cfg,
                 frame_idx: 0,
+                max_refs: max_refs(cfg.width, cfg.height),
+                rfi: false,
                 _input: input.clone(),
                 _device: device.clone(),
             };
             // From here on, Drop cleans up whatever was created if a step fails.
+            this.rfi = this.cap(_NV_ENC_CAPS_NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) > 0;
             this.configure()?;
             call!(this, nvEncInitializeEncoder(this.enc, &mut *this.init));
 
@@ -187,6 +198,7 @@ impl Encoder {
 
         let h = &mut c.encodeCodecConfig.h264Config;
         h.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        h.maxNumRefFrames = self.max_refs;
         h.set_repeatSPSPPS(1); // every keyframe is self-contained, so a client can join any time
         h.set_outputAUD(0);
         // Tell the decoder exactly how to turn YUV back into RGB: BT.709, limited range.
@@ -217,6 +229,38 @@ impl Encoder {
         i.enablePTD = 1;
         i.bufferFormat = FMT_ARGB;
         i.encodeConfig = &mut *self.config;
+        Ok(())
+    }
+
+    /// One NVENC capability value for H.264 (0 if the query fails).
+    unsafe fn cap(&self, which: NV_ENC_CAPS) -> i32 {
+        let Some(f) = self.api.nvEncGetEncodeCaps else { return 0 };
+        let mut q: NV_ENC_CAPS_PARAM = zeroed();
+        q.version = CAPS_PARAM_VER;
+        q.capsToQuery = which;
+        let mut v = 0i32;
+        if f(self.enc, CODEC_H264, &mut q, &mut v) == _NVENCSTATUS_NV_ENC_SUCCESS {
+            v
+        } else {
+            0
+        }
+    }
+
+    /// True if lost frames can be invalidated instead of sending a keyframe.
+    pub fn supports_rfi(&self) -> bool {
+        self.rfi
+    }
+
+    /// Reference frames kept: a loss more than this many frames back needs a keyframe.
+    pub fn max_refs(&self) -> u32 {
+        self.max_refs
+    }
+
+    /// Stops later frames from referencing the frame encoded with `timestamp_us`.
+    pub fn invalidate(&mut self, timestamp_us: u64) -> Result<()> {
+        unsafe {
+            call!(self, nvEncInvalidateRefFrames(self.enc, timestamp_us));
+        }
         Ok(())
     }
 
@@ -317,5 +361,22 @@ impl Drop for Encoder {
                 }
             }
         }
+    }
+}
+
+/// Reference frames for this size: up to 16, within what H.264 level 5.1 allows (which hardware
+/// decoders support): 16 at 1080p, 12 at 1440p, 5 at 4K.
+fn max_refs(width: u32, height: u32) -> u32 {
+    let macroblocks = width.div_ceil(16) * height.div_ceil(16);
+    (184_320 / macroblocks.max(1)).clamp(1, 16)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reference_frames_fit_level_5_1() {
+        assert_eq!(super::max_refs(1920, 1080), 16);
+        assert_eq!(super::max_refs(2560, 1440), 12);
+        assert_eq!(super::max_refs(3840, 2160), 5);
     }
 }

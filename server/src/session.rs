@@ -42,6 +42,8 @@ pub struct Settings {
 
 struct Shared {
     force_idr: AtomicBool,
+    /// The client lost frames from this id on: invalidate them and send a recovery frame.
+    invalidate: Mutex<Option<u32>>,
     /// The screen being shown; the video thread rebuilds its pipeline when `switch` is set.
     monitor: Mutex<MonitorInfo>,
     switch: AtomicBool,
@@ -342,7 +344,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         list: ms.iter().map(|m| proto::ctrl::MonitorDesc { width: m.width as u16, height: m.height as u16, primary: m.left == 0 && m.top == 0 }).collect(),
     };
     out_tx.send(describe(&monitors, current))?;
-    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), monitor: Mutex::new(s.monitor.clone()), switch: AtomicBool::new(false), out: out_tx.clone(), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
+    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), invalidate: Mutex::new(None), monitor: Mutex::new(s.monitor.clone()), switch: AtomicBool::new(false), out: out_tx.clone(), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
     let video = {
         let (conn, s, shared) = (conn.clone(), s.clone(), shared.clone());
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
@@ -388,6 +390,11 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         loop {
             match read_ctrl(&mut recv).await? {
                 Ctrl::KeyframeRequest => shared.force_idr.store(true, Ordering::Release),
+                Ctrl::RefInvalidate { from } => {
+                    let mut pending = shared.invalidate.lock().unwrap();
+                    // Several requests before the next frame: repair from the oldest loss.
+                    *pending = Some(pending.map_or(from, |p| if from.wrapping_sub(p) as i32 <= 0 { from } else { p }));
+                }
                 Ctrl::Ping { client_us } => out_tx.send(Ctrl::Pong { client_us, server_us: now_us() })?,
                 Ctrl::SelectMonitor { index } => {
                     // Screens may have been plugged in or out since the list was sent.
@@ -448,7 +455,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let interval = Duration::from_secs_f64(1.0 / s.fps.max(1) as f64);
     let mut buf = Vec::with_capacity(1 << 20);
     let mut ticker = Ticker::new(Duration::from_secs(1));
-    let (mut frames, mut bytes, mut keys, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    let (mut frames, mut bytes, mut keys, mut dropped, mut repairs) = (0u64, 0u64, 0u64, 0u64, 0u64);
     // Time spent waiting for the network to drain the send queue (per stats second).
     let mut net_wait = Duration::ZERO;
     let (mut enc_ms, mut bridge_ms) = (Dist::default(), Dist::default());
@@ -475,6 +482,10 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             }
         };
         let mut need_idr = true;
+        // (frame id, capture time = NVENC timestamp) of the frames sent since the last keyframe
+        // that the encoder still holds as references, oldest first.
+        let mut refs: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+        let max_refs = p.encoder().max_refs() as usize;
         while !shared.stop.load(Ordering::Acquire) {
             if shared.switch.load(Ordering::Acquire) {
                 continue 'pipeline; // another screen: rebuild capture + encoder for it
@@ -498,7 +509,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 }
                 let (target, fec) = (new_bps as f64 / 1e6, rate.fec_percent());
                 println!(
-                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | fec {fec}% | encode ms {enc} | {}key {keys} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms{} | lost pkts {lost}",
+                    "[{}] send fps {fps:5.1} | {mbit:6.2} Mbit/s | rate {target:.1} Mbit/s ({}) | fec {fec}% | encode ms {enc} | {}key {keys} | repaired {repairs} | dropped {dropped} | net wait {wait_ms:.0} ms | rtt {rtt:.1} ms{} | lost pkts {lost}",
                     p.capture_mode(),
                     rate.reason(),
                     if p.bridged() { format!("copy ms {} | ", bridge_ms.take()) } else { String::new() },
@@ -514,7 +525,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 });
                 lost_prev = st.path.lost_packets;
                 sent_prev = st.path.sent_packets;
-                (frames, bytes, keys, dropped, net_wait) = (0, 0, 0, 0, Duration::ZERO);
+                (frames, bytes, keys, dropped, repairs, net_wait) = (0, 0, 0, 0, 0, Duration::ZERO);
             }
             // Backpressure: while quinn still holds more than ~2 frames of unsent data, don't
             // capture or encode at all. Skipping *before* the encoder keeps its reference chain
@@ -526,13 +537,40 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 net_wait += started.elapsed();
                 continue;
             }
+            // A loss to repair: invalidate the lost frames and everything sent after them, so the
+            // next frame is predicted from the newest frame the client still has. Possible while
+            // that frame is still one of the encoder's references; otherwise a keyframe.
+            let mut recovery_for = None;
+            if let Some(from) = shared.invalidate.lock().unwrap().take() {
+                let before = from.wrapping_sub(1);
+                let usable = p.encoder().supports_rfi() && !need_idr && refs.iter().any(|&(id, _)| id == before);
+                let mut ok = usable;
+                if usable {
+                    for &(id, ts) in refs.iter().filter(|(id, _)| id.wrapping_sub(from) as i32 >= 0) {
+                        if let Err(err) = p.encoder().invalidate(ts) {
+                            eprintln!("invalidate frame {id}: {err:#}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    refs.retain(|(id, _)| (id.wrapping_sub(from) as i32) < 0);
+                    recovery_for = Some(from);
+                } else {
+                    shared.force_idr.store(true, Ordering::Release);
+                }
+            }
             let force = shared.force_idr.swap(false, Ordering::AcqRel) | need_idr;
             buf.clear();
-            let e = match p.next(50, force, &mut buf) {
+            let e = match p.next(50, force, recovery_for.is_some(), &mut buf) {
                 Ok(Some(e)) => e,
                 Ok(None) => {
                     if force {
                         shared.force_idr.store(true, Ordering::Release); // not served yet
+                    }
+                    if let Some(from) = recovery_for {
+                        shared.invalidate.lock().unwrap().get_or_insert(from); // not served yet
                     }
                     continue;
                 }
@@ -558,7 +596,8 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 need_idr = true;
                 continue;
             }
-            let grams = match fragment(frame_id, e.capture_us, e.keyframe, &buf, max, rate.fec_percent()) {
+            let recovery_for = recovery_for.filter(|_| !e.keyframe);
+            let grams = match fragment(frame_id, e.capture_us, e.keyframe, recovery_for, &buf, max, rate.fec_percent()) {
                 Ok(g) => g,
                 Err(err) => {
                     eprintln!("fragment: {err:#}");
@@ -580,6 +619,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                     }
                 }
             }
+            if e.keyframe {
+                refs.clear(); // nothing before a keyframe can be referenced
+            }
+            refs.push_back((frame_id, e.capture_us));
+            while refs.len() > max_refs {
+                refs.pop_front();
+            }
+            repairs += recovery_for.is_some() as u64;
             frame_id = frame_id.wrapping_add(1);
             frames += 1;
             bytes += buf.len() as u64;

@@ -31,6 +31,6 @@
 - [x] Forward Win key / Alt+Tab / Ctrl+Esc (low-level keyboard hook in the viewer).
 - [x] Show the remote cursor shape (standard shapes by id, app pointers as images; protocol v3).
 - [x] FEC: Reed-Solomon parity per frame, 10–40 % following loss (protocol v2).
-- [ ] NVENC reference-frame invalidation, so a frame FEC can't save costs no keyframe either.
+- [x] NVENC reference-frame invalidation: a frame FEC can't save is repaired without a keyframe (16 refs at 1080p).
 - [x] Tray icon (left click opens, right click menu, status tooltip; ─ and ✕ go to the tray).
 - [ ] Code-sign the exe/installer (removes the SmartScreen "unknown publisher" warning).

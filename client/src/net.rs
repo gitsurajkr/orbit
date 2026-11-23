@@ -9,7 +9,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use proto::clock::{now_us, ClockSync};
 use proto::ctrl::{Ctrl, HEADER_LEN};
-use proto::video::{keyframe_retry, Event, Frame, KeyframeGate, Reassembler};
+use proto::video::{keyframe_retry, Event, Frame, KeyframeGate, Reassembler, Request};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{Connection, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -40,6 +40,8 @@ pub struct NetStats {
     pub lost: AtomicU64,
     pub skipped: AtomicU64,
     pub keyframe_requests: AtomicU64,
+    /// Invalidation requests (repair by a recovery frame instead of a keyframe).
+    pub invalidations: AtomicU64,
     /// Frames rebuilt by FEC (they'd have been lost without it).
     pub recovered: AtomicU64,
 }
@@ -319,7 +321,7 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
                     _ = tick.tick() => reasm.expire(Instant::now(), &mut events),
                 }
                 if failed.swap(false, Ordering::AcqRel) {
-                    gate.on_lost();
+                    gate.on_decode_error();
                 }
                 for ev in events.drain(..) {
                     match ev {
@@ -328,7 +330,7 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
                             if f.recovered {
                                 stats.recovered.fetch_add(1, Ordering::Relaxed);
                             }
-                            if gate.admit(f.keyframe) {
+                            if gate.admit(f.keyframe, f.recovery_for) {
                                 if frames_tx.send(f).is_err() {
                                     return;
                                 }
@@ -339,13 +341,20 @@ pub async fn connect(server: SocketAddr, opts: &ConnectOptions, frames_tx: mpsc:
                         }
                         Event::Lost { from, to } => {
                             stats.lost.fetch_add(to.wrapping_sub(from) as u64 + 1, Ordering::Relaxed);
-                            gate.on_lost();
+                            gate.on_lost(from);
                         }
                     }
                 }
-                if gate.should_request(Instant::now(), keyframe_retry(conn.rtt())) {
-                    stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
-                    let _ = ctrl.send(Ctrl::KeyframeRequest);
+                match gate.should_request(Instant::now(), keyframe_retry(conn.rtt())) {
+                    Some(Request::Keyframe) => {
+                        stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                        let _ = ctrl.send(Ctrl::KeyframeRequest);
+                    }
+                    Some(Request::Invalidate { from }) => {
+                        stats.invalidations.fetch_add(1, Ordering::Relaxed);
+                        let _ = ctrl.send(Ctrl::RefInvalidate { from });
+                    }
+                    None => {}
                 }
             }
             wake.signal(); // let the window notice the connection ended

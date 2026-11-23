@@ -26,6 +26,8 @@ pub enum Ctrl {
     PairProof { proof: Vec<u8> },
     /// S→C: connection refused, with the reason to show. The connection closes after it.
     Denied { reason: String },
+    /// C→S: frames from `from` on were lost; invalidate them and send a recovery frame.
+    RefInvalidate { from: u32 },
     /// C→S. Sent repeatedly (rate-limited) until a keyframe actually arrives.
     KeyframeRequest,
     /// C→S. `scan` is the hardware scan code, so it's independent of keyboard layout.
@@ -125,6 +127,7 @@ mod tag {
     pub const MONITORS: u8 = 16;
     pub const SELECT_MONITOR: u8 = 17;
     pub const VIDEO_FORMAT: u8 = 18;
+    pub const REF_INVALIDATE: u8 = 19;
 }
 
 /// Longest name / reason text carried (bytes, cut at a character boundary).
@@ -176,6 +179,10 @@ impl Ctrl {
             Ctrl::SelectMonitor { index } => {
                 out.push(index);
                 tag::SELECT_MONITOR
+            }
+            Ctrl::RefInvalidate { from } => {
+                out.extend_from_slice(&from.to_le_bytes());
+                tag::REF_INVALIDATE
             }
             Ctrl::VideoFormat { width, height } => {
                 out.extend_from_slice(&width.to_le_bytes());
@@ -271,6 +278,10 @@ impl Ctrl {
             tag::SELECT_MONITOR => {
                 need(1)?;
                 Ctrl::SelectMonitor { index: b[0] }
+            }
+            tag::REF_INVALIDATE => {
+                need(4)?;
+                Ctrl::RefInvalidate { from: u32::from_le_bytes(b[0..4].try_into().unwrap()) }
             }
             tag::VIDEO_FORMAT => {
                 need(4)?;
@@ -372,6 +383,7 @@ mod tests {
             Ctrl::Monitors { current: 1, list: vec![MonitorDesc { width: 2560, height: 1440, primary: true }, MonitorDesc { width: 1920, height: 1080, primary: false }] },
             Ctrl::Monitors { current: 0, list: vec![] },
             Ctrl::SelectMonitor { index: 2 },
+            Ctrl::RefInvalidate { from: 0xFFFF_FFF0 },
             Ctrl::VideoFormat { width: 1920, height: 1080 },
             Ctrl::PairStart { msg: vec![1, 2, 3] },
             Ctrl::PairReply { msg: vec![4; 33] },

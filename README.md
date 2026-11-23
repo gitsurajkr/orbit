@@ -29,7 +29,7 @@ packet-loss recovery, in a single portable `.exe`.
 | **GPU end to end** | Desktop Duplication capture → NVENC H.264 → hardware decode → tearing flip-model present. On a PC whose screen runs on the NVIDIA GPU, frames never leave video memory before encoding. |
 | **Always the newest frame** | No frame queues anywhere. If the network falls behind, ORBIT waits before encoding instead of sending stale frames, so latency stays flat. |
 | **Adapts to the link** | Bitrate follows round-trip time, packet loss and send-queue pressure every second. The encoder is retuned live, without a keyframe. |
-| **Survives packet loss** | Every frame carries Reed-Solomon parity (10–40 %, following measured loss). Lost packets are rebuilt on arrival: no freeze, no resend. |
+| **Survives packet loss** | Every frame carries Reed-Solomon parity (10–40 %, following measured loss). Lost packets are rebuilt on arrival: no freeze, no resend. A frame lost anyway is repaired with reference-frame invalidation: the next frame is predicted from an older one the viewer has, so there's no blurry keyframe. |
 | **QUIC + BBR transport** | Video travels as unreliable QUIC datagrams, paced by BBR congestion control, over Tailscale's encrypted WireGuard tunnel. |
 | **Runs quietly** | Lives in the notification area, can start sharing when Windows starts, and updates itself from GitHub Releases. |
 
@@ -140,7 +140,7 @@ Latency is measured from capture on the sharing PC to present on the viewer, on 
 | `DROPPED` | Encoded frames thrown away (should stay at 0) |
 | `DIRECT` · `RELAY BOM` · `PEER RELAY` | How Tailscale carries the traffic right now. A relay adds latency; Tailscale often switches to direct after a few seconds |
 
-**Viewer title bar:** `fps (recv) | Mbit/s | latency ms avg/p95/max | DIRECT` (or `RELAY BOM`). The full line, printed when the viewer runs from a terminal, adds `decode ms`, `frame spread ms`, `rtt` and `lost · skip · keyreq · fec-fixed`. `fec-fixed` counts frames that FEC saved from being lost.
+**Viewer title bar:** `fps (recv) | Mbit/s | latency ms avg/p95/max | DIRECT` (or `RELAY BOM`). The full line, printed when the viewer runs from a terminal, adds `decode ms`, `frame spread ms`, `rtt` and `lost · skip · keyreq · repair-req · fec-fixed`. `fec-fixed` counts frames that FEC saved from being lost; `repair-req` counts losses repaired by reference-frame invalidation instead of a keyframe (`repaired` on the sharing PC).
 
 ## Security
 
@@ -170,7 +170,6 @@ How a device gets on the list, once:
 
 ## Roadmap
 
-- [ ] NVENC reference-frame invalidation: recover from heavy loss without a keyframe
 - [ ] Lower resolution automatically on very slow links
 - [ ] Lock screen and UAC capture (Windows service)
 

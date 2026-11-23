@@ -112,10 +112,11 @@ impl Pipeline {
     }
 
     /// Waits up to `timeout_ms` for the screen to change, then encodes it into `out`.
-    /// With `force_idr` and no change, re-encodes the last image as a keyframe right away, so a
-    /// keyframe request never waits for the screen to change.
-    pub fn next(&mut self, timeout_ms: u32, force_idr: bool, out: &mut Vec<u8>) -> Result<Option<Encoded>> {
-        let wait = if force_idr && self.have_image { 0 } else { timeout_ms };
+    /// With `force_idr` (keyframe) or `force_frame` (recovery frame) and no change, re-encodes
+    /// the last image right away, so a repair never waits for the screen to change.
+    pub fn next(&mut self, timeout_ms: u32, force_idr: bool, force_frame: bool, out: &mut Vec<u8>) -> Result<Option<Encoded>> {
+        let force_idr_or_frame = force_idr || force_frame;
+        let wait = if force_idr_or_frame && self.have_image { 0 } else { timeout_ms };
         let mut copy_ms = 0.0;
         let mut capture_us = 0;
         let grabbed = match &mut self.source {
@@ -144,7 +145,7 @@ impl Pipeline {
         }
         if grabbed {
             self.have_image = true;
-        } else if !(force_idr && self.have_image) {
+        } else if !(force_idr_or_frame && self.have_image) {
             return Ok(None);
         }
         let t1 = Instant::now();
