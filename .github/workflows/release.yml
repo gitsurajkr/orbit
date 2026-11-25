@@ -37,6 +37,10 @@ jobs:
       - name: Build orbit.exe
         run: cargo build --release -p app
 
+      - name: Build the ORBIT Display driver
+        shell: pwsh
+        run: drivers\build.ps1 -Version $env:VERSION
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 

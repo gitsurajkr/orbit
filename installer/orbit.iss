@@ -38,6 +38,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+; The ORBIT Display driver (drivers\build.ps1): a virtual monitor for PCs with no monitor attached.
+; Signed on this PC at install time (see [Run]); Windows runs it from its driver store, not from here.
+Source: "..\drivers\out\x64\*"; DestDir: "{app}\driver"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -56,6 +59,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{
 ; The ORBIT Service: sharing through it includes the lock screen and UAC prompts. Also
 ; copies this user's ORBIT ID and paired devices to it, and keeps its settings on updates.
 Filename: "{app}\{#AppExe}"; Parameters: "--install-service"; Flags: runhidden waituntilterminated; StatusMsg: "Setting up the ORBIT service..."
+; The virtual monitor driver. If Windows or an antivirus refuses it, ORBIT still installs and works:
+; a PC without a monitor is then shared with the slower compatible capture instead.
+Filename: "{app}\{#AppExe}"; Parameters: "--display-driver install ""{app}\driver"""; Flags: runhidden waituntilterminated; StatusMsg: "Installing the ORBIT virtual display..."
 ; As the normal user: started from the (elevated) installer it would run as administrator, and the
 ; ORBIT the user opens later couldn't bring that window forward (Windows blocks it), so it looked dead.
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
@@ -65,6 +71,8 @@ Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilen
 [UninstallRun]
 ; "Always on" (the ORBIT Service): remove it before the files go.
 Filename: "{app}\{#AppExe}"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+; The virtual monitor driver: device, driver package and the per-PC signing certificate.
+Filename: "{app}\{#AppExe}"; Parameters: "--display-driver uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveDisplayDriver"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden; RunOnceId: "RemoveFirewallRule"
 
 [Code]

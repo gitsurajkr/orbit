@@ -54,6 +54,11 @@ pub fn install(dir: &Path) -> Result<()> {
     if !Path::new(&inf).exists() || !Path::new(&cat).exists() {
         bail!("{dir} doesn't hold the ORBIT Display package (OrbitDisplay.inf + orbitdisplay.cat)");
     }
+    // A fresh install every time (updates too): the old device and every old package go first, so
+    // the new driver is what runs and old versions don't pile up in the driver store.
+    if let Err(e) = remove_device_and_packages() {
+        println!("display driver: removing the previous install: {e:#} (continuing)");
+    }
     sign_for_this_pc(&cat)?;
     println!("display driver: signed for this PC");
     unsafe {
@@ -80,6 +85,24 @@ pub fn install(dir: &Path) -> Result<()> {
 /// Removes the device, every ORBIT Display package in the driver store, and the signing trust.
 pub fn uninstall() -> Result<()> {
     let mut problems = Vec::new();
+    if let Err(e) = remove_device_and_packages() {
+        problems.push(format!("{e:#}"));
+    }
+    if let Err(e) = powershell(&format!(
+        "Get-ChildItem Cert:\\LocalMachine\\Root, Cert:\\LocalMachine\\TrustedPublisher | Where-Object Subject -eq '{CERT_SUBJECT}' | Remove-Item"
+    )) {
+        problems.push(format!("removing the signing certificate: {e:#}"));
+    }
+    if !problems.is_empty() {
+        bail!("{}", problems.join("; "));
+    }
+    println!("display driver: uninstalled");
+    Ok(())
+}
+
+/// Removes our device(s) and every driver-store package that installs them.
+fn remove_device_and_packages() -> Result<()> {
+    let mut problems = Vec::new();
     unsafe {
         for (set, info) in devices()? {
             if let Err(e) = DiUninstallDevice(HWND::default(), set.0, &info, 0, None) {
@@ -95,15 +118,9 @@ pub fn uninstall() -> Result<()> {
             problems.push(format!("removing {oem}: {}", std::io::Error::last_os_error()));
         }
     }
-    if let Err(e) = powershell(&format!(
-        "Get-ChildItem Cert:\\LocalMachine\\Root, Cert:\\LocalMachine\\TrustedPublisher | Where-Object Subject -eq '{CERT_SUBJECT}' | Remove-Item"
-    )) {
-        problems.push(format!("removing the signing certificate: {e:#}"));
-    }
     if !problems.is_empty() {
         bail!("{}", problems.join("; "));
     }
-    println!("display driver: uninstalled");
     Ok(())
 }
 
