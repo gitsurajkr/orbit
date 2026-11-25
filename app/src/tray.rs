@@ -22,6 +22,7 @@ const WM_SHOW_MAIN: u32 = WM_APP + 3;
 const WM_HIDE_MAIN: u32 = WM_APP + 4;
 const ID_OPEN: usize = 1;
 const ID_QUIT: usize = 2;
+const ID_LOGS: usize = 3;
 
 static TIP: Mutex<String> = Mutex::new(String::new());
 static TASKBAR_CREATED: Mutex<u32> = Mutex::new(0);
@@ -150,6 +151,7 @@ unsafe fn run(tx: std::sync::mpsc::Sender<Option<isize>>) {
 unsafe fn menu(hwnd: HWND) {
     let Ok(m) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(m, MF_STRING, ID_OPEN, w!("Open ORBIT"));
+    let _ = AppendMenuW(m, MF_STRING, ID_LOGS, w!("Open logs folder"));
     let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
     let _ = AppendMenuW(m, MF_STRING, ID_QUIT, w!("Quit ORBIT"));
     let mut p = POINT::default();
@@ -198,6 +200,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         show_window(h);
                     }
                 }
+                ID_LOGS => crate::logfile::open_folder(),
                 ID_QUIT => {
                     // Same as closing the window for real: eframe exits, on_exit stops sharing.
                     if let Some(h) = main_window() {

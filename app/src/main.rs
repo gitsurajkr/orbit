@@ -14,6 +14,7 @@ mod always_on;
 mod autostart;
 mod config;
 mod icon;
+mod logfile;
 mod pipe;
 mod service;
 mod tray;
@@ -33,15 +34,19 @@ fn main() {
     }
     let flag = |f: &str| args.iter().any(|a| a == f);
     if flag("--service") {
-        let _ = service::run();
-        return;
+        logfile::start(&service::log_dir(), "service", "service (keeps the agent running)");
+        if let Err(e) = service::run() {
+            eprintln!("service: {e:#}");
+        }
+        logfile::exit(0);
     }
     if flag("--agent") {
+        logfile::start(&service::log_dir(), "agent", "agent (shares the screen as SYSTEM)");
         if let Err(e) = service::run_agent() {
-            eprintln!("{e:#}");
-            std::process::exit(1);
+            eprintln!("agent stopped: {e:#}");
+            logfile::exit(1);
         }
-        return;
+        logfile::exit(0);
     }
     if flag("--service-status") {
         println!("service: {:?}", service::status_detail().map_err(|e| format!("{e:#}")));
@@ -52,6 +57,7 @@ fn main() {
         return;
     }
     if flag("--install-service") || flag("--uninstall-service") {
+        logfile::start(&logfile::user_dir(), "setup", "service setup");
         let num = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f64>().ok());
         // Without --fps etc. (the installer), the agent keeps its settings across updates.
         let settings = num("--fps").map(|fps| service::AgentSettings {
@@ -64,14 +70,16 @@ fn main() {
         let r = if flag("--install-service") { service::install(settings.as_ref()) } else { service::uninstall() };
         if let Err(e) = r {
             eprintln!("{e:#}");
-            std::process::exit(1);
+            logfile::exit(1);
         }
-        return;
+        println!("done");
+        logfile::exit(0);
     }
     if let Some(i) = args.iter().position(|a| a == "--connect") {
+        logfile::start(&logfile::user_dir(), "viewer", "viewer");
         let Some(addr) = args.get(i + 1) else {
             eprintln!("--connect needs an address");
-            std::process::exit(2);
+            logfile::exit(2);
         };
         let view_only = args.iter().any(|a| a == "--view-only");
         let opts = client::ConnectOptions {
@@ -81,9 +89,10 @@ fn main() {
         };
         if let Err(e) = client::run_viewer(addr, view_only, &opts) {
             eprintln!("{e:#}");
-            std::process::exit(viewer_exit_code(&e));
+            logfile::exit(viewer_exit_code(&e));
         }
-        return;
+        println!("viewer closed");
+        logfile::exit(0);
     }
     server::dpi_aware();
     // ORBIT_SECOND_INSTANCE=1: a test copy next to the installed one (development only).
@@ -95,11 +104,14 @@ fn main() {
             None => return, // already running: brought the existing window forward
         }
     };
+    logfile::start(&logfile::user_dir(), "orbit", "launcher");
     let launched_at_login = args.iter().any(|a| a == "--autostart");
     if let Err(e) = ui::run(launched_at_login) {
         eprintln!("{e}");
-        std::process::exit(1);
+        logfile::exit(1);
     }
+    println!("quit");
+    logfile::finish();
 }
 
 /// Viewer exit codes the launcher understands (anything else non-zero is a plain error).

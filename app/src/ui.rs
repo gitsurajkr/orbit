@@ -181,6 +181,7 @@ impl App {
         if accept_new_identity {
             cmd.arg("--accept-new-identity");
         }
+        println!("connect to {addr}{}{}", if code.is_some() { " with a pairing code" } else { "" }, if accept_new_identity { " (accepting its new ID)" } else { "" });
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -199,6 +200,11 @@ impl App {
             }
             let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
             let msg = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("the viewer closed unexpectedly").to_string();
+            if code == 0 {
+                println!("viewer closed");
+            } else {
+                println!("viewer ended (exit {code}): {msg}");
+            }
             *r.lock().unwrap() = Some(if code == 0 { Ok(()) } else { Err((code, msg)) });
             ctx2.request_repaint();
         });
@@ -721,6 +727,7 @@ impl App {
 
     fn toggle_share(&mut self) {
         if let Some(s) = self.server.take() {
+            println!("sharing stopped");
             s.stop();
             self.user_stopped = true;
             self.auto_share_at = None;
@@ -743,8 +750,14 @@ impl App {
             server::ServerHandle::start(settings, server::net::default_bind())
         };
         match start() {
-            Ok(s) => self.server = Some(s),
-            Err(e) => self.share_error = Some(format!("{e:#}")),
+            Ok(s) => {
+                println!("sharing started: screen {}, {} fps, {} Mbit/s", self.monitor + 1, FPS_OPTIONS[self.cfg.fps_index], self.cfg.mbps);
+                self.server = Some(s);
+            }
+            Err(e) => {
+                println!("sharing couldn't start: {e:#}");
+                self.share_error = Some(format!("{e:#}"));
+            }
         }
         self.cfg.save();
     }
@@ -1096,6 +1109,7 @@ impl App {
     /// SHARE / STOP and the status, when the ORBIT Service does the sharing.
     fn service_share(&mut self, ui: &mut egui::Ui, sharing: bool) {
         if widgets::orbit_button(ui, "share", if sharing { "STOP" } else { "SHARE" }, if sharing { "SHARING LIVE" } else { "START SHARING" }, sharing, true).clicked() {
+            println!("{} sharing (ORBIT service)", if sharing { "stop" } else { "start" });
             self.always.command(serde_json::json!({"cmd": "settings", "sharing": !sharing}));
         }
         let status = self.always.status();
@@ -1446,7 +1460,7 @@ fn tailscale_hint(ui: &mut egui::Ui, ts: &proto::tailscale::Snapshot) -> bool {
 }
 
 /// Opens a web page in the default browser.
-fn open_url(url: &str) {
+pub fn open_url(url: &str) {
     use windows::core::{w, HSTRING};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;

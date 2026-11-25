@@ -475,6 +475,17 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         let mon = shared.monitor.lock().unwrap().clone();
         let mut p = match Pipeline::new(mon.clone(), s.fps, rate.video_bps()) {
             Ok(p) => {
+                println!(
+                    "video: {} {}x{} via {}, {} fps cap, {:.1} Mbit/s, {} reference frames{}",
+                    mon.device_name,
+                    mon.width,
+                    mon.height,
+                    p.capture_mode(),
+                    s.fps,
+                    rate.video_bps() as f64 / 1e6,
+                    p.encoder_max_refs(),
+                    if p.encoder_rfi() { "" } else { " (no repair support: losses need keyframes)" }
+                );
                 shared.status.update(|i| i.error = None);
                 // Tell the viewer the size before the first frame (the new keyframe).
                 let _ = shared.out.send(Ctrl::VideoFormat { width: mon.width as u16, height: mon.height as u16 });
@@ -606,6 +617,17 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 // Fallback for one frame too big for the queue's free space (the check above
                 // normally waits before encoding). Dropping an encoded frame breaks the
                 // reference chain, so the next frame must be a keyframe.
+                if dropped == 0 {
+                    // At most once a second (the counter resets with the stats).
+                    println!(
+                        "dropped a {} of {} KB: {} KB already queued (limit {} KB), {} KB free",
+                        if e.keyframe { "keyframe" } else { "frame" },
+                        wire / 1024,
+                        backlog / 1024,
+                        backlog_limit / 1024,
+                        conn.datagram_send_buffer_space() / 1024
+                    );
+                }
                 dropped += 1;
                 need_idr = true;
                 continue;

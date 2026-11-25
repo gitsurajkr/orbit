@@ -97,6 +97,16 @@ impl Pipeline {
         &mut self.enc
     }
 
+    /// Reference frames the encoder keeps.
+    pub fn encoder_max_refs(&self) -> u32 {
+        self.enc.max_refs()
+    }
+
+    /// The encoder can repair a loss without a keyframe.
+    pub fn encoder_rfi(&self) -> bool {
+        self.enc.supports_rfi()
+    }
+
     /// True when frames take an extra copy (cross-GPU or GDI).
     pub fn bridged(&self) -> bool {
         !matches!(self.source, Source::Dup(_))

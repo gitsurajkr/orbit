@@ -247,15 +247,9 @@ fn supervise(stop: &AtomicBool) {
     }
 }
 
+/// One line in service.log (stdout goes there, see logfile.rs).
 fn log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_dir().join("service.log")) {
-        let _ = writeln!(f, "{} {msg}", unix_now());
-    }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    println!("{msg}");
 }
 
 mod spawn {
@@ -393,19 +387,7 @@ fn user_downloads(session: u32) -> PathBuf {
 /// `orbit.exe --agent`: shares this session's screen as SYSTEM until killed.
 pub fn run_agent() -> Result<()> {
     let dir = data_dir();
-    std::fs::create_dir_all(log_dir())?;
-    // Log to agent.log (the agent has no console); keep the previous run's log as agent.old.log.
-    let log_path = log_dir().join("agent.log");
-    let _ = std::fs::rename(&log_path, log_dir().join("agent.old.log"));
-    if let Ok(f) = std::fs::File::create(&log_path) {
-        use std::os::windows::io::IntoRawHandle;
-        use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
-        let h = windows::Win32::Foundation::HANDLE(f.into_raw_handle());
-        unsafe {
-            let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
-        }
-    }
+    // Output goes to agent.log (started in main, see logfile.rs).
     let session = spawn::console_session().unwrap_or(0);
     std::env::set_var("ORBIT_HOME", &dir);
     std::env::set_var("ORBIT_DOWNLOADS", user_downloads(session));
