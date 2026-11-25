@@ -56,7 +56,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{
 ; The ORBIT Service: sharing through it includes the lock screen and UAC prompts. Also
 ; copies this user's ORBIT ID and paired devices to it, and keeps its settings on updates.
 Filename: "{app}\{#AppExe}"; Parameters: "--install-service"; Flags: runhidden waituntilterminated; StatusMsg: "Setting up the ORBIT service..."
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; As the normal user: started from the (elevated) installer it would run as administrator, and the
+; ORBIT the user opens later couldn't bring that window forward (Windows blocks it), so it looked dead.
+Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 ; In-app updates run the installer silently: start the new version afterwards, as the normal user.
 Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
