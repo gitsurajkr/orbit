@@ -25,6 +25,12 @@ Write-Host "Version: $current -> version = `"$Version`""
 cargo build --release -p app
 if ($LASTEXITCODE -ne 0) { git checkout -- Cargo.toml; throw "Build failed; version change undone." }
 
+# The new build must find the releases on GitHub, or no installed ORBIT will ever see an update.
+$exe = Join-Path $PSScriptRoot 'target\release\orbit.exe'
+$check = & $exe --check-update | Out-String
+Write-Host "Update check: $($check.Trim())"
+if ($check -notmatch '^(up to date|update available)') { git checkout -- Cargo.toml Cargo.lock; throw "The update check can't reach the releases; version change undone." }
+
 git add Cargo.toml Cargo.lock; Assert-Ok "git add"
 git commit -q -m "release v$Version"; Assert-Ok "git commit"
 git tag "v$Version"; Assert-Ok "git tag"

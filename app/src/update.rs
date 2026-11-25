@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const REPO: &str = "gitsurajkr/orvia-desk";
+pub const REPO: &str = "gitsurajkr/orbit";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const INSTALLER: &str = "ORBIT-Setup.exe";
 const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
@@ -73,7 +73,9 @@ pub fn check() -> Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = match agent().get(&url).set("Accept", "application/vnd.github+json").call() {
         Ok(r) => r,
-        Err(ureq::Error::Status(404, _)) => return Ok(None), // no releases yet
+        // ORBIT always has releases: a 404 means the repository moved (v0.3.7 and older still
+        // asked under its old name and silently reported "up to date" forever).
+        Err(ureq::Error::Status(404, _)) => bail!("no releases found at github.com/{REPO}"),
         Err(e) => return Err(e).context("checking for updates"),
     };
     let json: serde_json::Value = resp.into_json()?;
@@ -198,8 +200,11 @@ impl Updater {
             let next = match check() {
                 Ok(Some(r)) => State::Available(r),
                 Ok(None) => State::Idle,
-                // A failed check (offline, rate-limited) is silent; we try again later.
-                Err(_) => return,
+                // A failed check (offline, rate-limited) isn't shown; we try again later.
+                Err(e) => {
+                    eprintln!("update check failed: {e:#}");
+                    return;
+                }
             };
             let mut st = state.lock().unwrap();
             // Don't overwrite a manual check's result or a download in progress.
