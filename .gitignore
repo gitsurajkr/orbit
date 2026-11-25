@@ -2,3 +2,7 @@
 *.pdb
 /dist
 claude.md
+/drivers/packages
+/drivers/out
+/drivers/.tools
+/drivers/orbit-display/x64

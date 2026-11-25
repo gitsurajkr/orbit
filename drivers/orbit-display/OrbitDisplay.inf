@@ -1,0 +1,73 @@
+; OrbitDisplay.inf - installs the ORBIT Display virtual display adapter (user-mode IddCx driver).
+; The device is created by ORBIT itself (hardware ID Root\OrbitDisplay); build.ps1 stamps the
+; version, architecture and UMDF version into the $...$ placeholders.
+; SPDX-License-Identifier: MIT
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+ClassVer    = 2.0
+Provider    = %Orbit%
+CatalogFile = OrbitDisplay.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Orbit% = OrbitModels, NT$ARCH$.10.0...18362
+
+[OrbitModels.NT$ARCH$.10.0...18362]
+%AdapterName% = OrbitDisplay, Root\OrbitDisplay
+
+[SourceDisksNames]
+1 = %Media%
+
+[SourceDisksFiles]
+OrbitDisplay.dll = 1
+
+[DestinationDirs]
+OrbitDisplay.Files = 13   ; the driver store: the DLL runs from where the package was staged
+
+[OrbitDisplay.NT]
+CopyFiles = OrbitDisplay.Files
+
+[OrbitDisplay.Files]
+OrbitDisplay.dll
+
+[OrbitDisplay.NT.HW]
+AddReg = OrbitDisplay.Registry
+
+[OrbitDisplay.Registry]
+; IddCx display adapters sit on top of Windows' indirect display kernel driver.
+HKR, , UpperFilters, 0x00010000, "IndirectKmd"
+; Its own driver host process, so it never shares one with another vendor's driver.
+HKR, WUDF, DeviceGroupId, 0x00000000, "OrbitDisplay"
+; The control interface: SYSTEM (the ORBIT service) and Administrators only.
+HKR, , Security, , "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[OrbitDisplay.NT.Services]
+AddService = WUDFRd, 0x000001FA, OrbitDisplay.Reflector
+
+[OrbitDisplay.Reflector]
+DisplayName   = %Reflector%
+ServiceType   = 1   ; kernel driver
+StartType     = 3   ; on demand
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[OrbitDisplay.NT.Wdf]
+UmdfService                = OrbitDisplay, OrbitDisplay.Umdf
+UmdfServiceOrder           = OrbitDisplay
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing     = ProcessSharingDisabled
+
+[OrbitDisplay.Umdf]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary      = %13%\OrbitDisplay.dll
+UmdfExtensions     = IddCx0102
+
+[Strings]
+Orbit       = "ORBIT"
+AdapterName = "ORBIT Virtual Display Adapter"
+Media       = "ORBIT Display driver files"
+Reflector   = "Windows Driver Foundation - User-mode Driver Framework Reflector"
