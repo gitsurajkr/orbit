@@ -13,6 +13,7 @@
 mod always_on;
 mod autostart;
 mod config;
+mod display_driver;
 mod icon;
 mod logfile;
 mod pipe;
@@ -33,6 +34,11 @@ fn main() {
         return;
     }
     let flag = |f: &str| args.iter().any(|a| a == f);
+    if let Some(i) = args.iter().position(|a| a == "--display-driver") {
+        logfile::start(&logfile::user_dir(), "setup", "display driver");
+        let code = display_driver::cli(&args[i + 1..]);
+        logfile::exit(code);
+    }
     if flag("--service") {
         logfile::start(&service::log_dir(), "service", "service (keeps the agent running)");
         if let Err(e) = service::run() {

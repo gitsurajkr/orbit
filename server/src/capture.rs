@@ -66,6 +66,14 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
     Ok(out)
 }
 
+/// The LUID (Windows' id for a GPU) of the adapter at `index`.
+pub fn adapter_luid(index: u32) -> Result<windows::Win32::Foundation::LUID> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        Ok(factory.EnumAdapters1(index)?.GetDesc1()?.AdapterLuid)
+    }
+}
+
 /// Index of the first adapter from `vendor`, if any.
 pub fn find_adapter(vendor: u32) -> Result<Option<(u32, String)>> {
     unsafe {

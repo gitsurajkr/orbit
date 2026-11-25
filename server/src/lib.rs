@@ -9,6 +9,7 @@ pub mod net;
 pub mod nvenc;
 pub mod rate;
 pub mod session;
+pub mod vdisplay;
 pub mod video;
 
 pub use session::{ServerHandle, Settings, Status, StatusInfo};
