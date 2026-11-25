@@ -474,7 +474,49 @@ fn changed_monitor(shared: &Shared) -> Option<MonitorInfo> {
     Some(fresh)
 }
 
+/// Stable serial for ORBIT's virtual monitor: Windows keeps its settings (resolution, scaling)
+/// from one session to the next.
+const VIRTUAL_DISPLAY_SERIAL: u32 = 0x0B17_0001;
+
+/// No monitor is attached (nothing is drawn, so Desktop Duplication gets no image): add an ORBIT
+/// Display virtual monitor, drawn by the encoder's GPU, and make it the shown screen. None if the
+/// driver isn't installed or usable (then the GDI fallback stays). The monitor is removed when the
+/// returned value is dropped, i.e. when the session ends.
+fn switch_to_virtual_display(shared: &Shared) -> Option<crate::vdisplay::VirtualMonitor> {
+    let attempt = || -> anyhow::Result<(crate::vdisplay::VirtualMonitor, MonitorInfo)> {
+        let driver = crate::vdisplay::Driver::open()?;
+        let gpu = crate::capture::find_adapter(crate::capture::NVIDIA_VENDOR)?.and_then(|(i, _)| crate::capture::adapter_luid(i).ok());
+        let monitor = driver.add(1920, 1080, 60, VIRTUAL_DISPLAY_SERIAL, gpu)?;
+        let name = monitor.wait_active(Duration::from_secs(10))?;
+        let info = crate::capture::list_monitors()?
+            .into_iter()
+            .find(|m| m.device_name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| anyhow::anyhow!("{name} is on but not listed"))?;
+        Ok((monitor, info))
+    };
+    match attempt() {
+        Ok((monitor, info)) => {
+            println!("virtual display: on as {} {}x{} (drawn by '{}'); sharing it", info.device_name, info.width, info.height, info.adapter_name);
+            shared.input.set_monitor(info.clone());
+            *shared.monitor.lock().unwrap() = info;
+            Some(monitor)
+        }
+        Err(e) => {
+            println!("virtual display: not available ({e:#}); staying on compatible capture");
+            None
+        }
+    }
+}
+
 fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
+    // Declared first, so it outlives every pipeline that captures it (dropped last: removed after).
+    let mut virtual_display: Option<crate::vdisplay::VirtualMonitor> = None;
+    let mut virtual_tried = false;
+    // ORBIT_VIRTUAL_DISPLAY=1: use the virtual monitor even with a monitor attached (testing).
+    if std::env::var_os("ORBIT_VIRTUAL_DISPLAY").is_some_and(|v| v == "1") {
+        virtual_tried = true;
+        virtual_display = switch_to_virtual_display(&shared);
+    }
     let mut frame_id: u32 = 0;
     // Adaptive bitrate: the configured bitrate is the ceiling (see rate.rs).
     let mut rate = RateControl::new(s.bitrate_bps);
@@ -537,6 +579,15 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             if shared.switch.load(Ordering::Acquire) {
                 continue 'pipeline; // another screen: rebuild capture + encoder for it
             }
+            // Nothing is drawn (no monitor): once per session, try a virtual monitor and share
+            // that with the fast capture instead of the slow fallback.
+            if p.fell_back() && virtual_display.is_none() && !virtual_tried {
+                virtual_tried = true;
+                virtual_display = switch_to_virtual_display(&shared);
+                if virtual_display.is_some() {
+                    continue 'pipeline;
+                }
+            }
             // GDI capture gets no "desktop changed" error like Desktop Duplication does, so look
             // for a switch (lock screen, UAC; only visible as SYSTEM) every 250 ms.
             // GDI capture doesn't notice a new screen size either (e.g. a monitor plugged into a
@@ -580,6 +631,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 );
                 let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
                 let mode = match p.capture_mode() {
+                    _ if virtual_display.is_some() => "NO MONITOR: ORBIT VIRTUAL DISPLAY · ",
                     "gdi" if p.fell_back() => "NO ACTIVE MONITOR: COMPAT CAPTURE · ",
                     "gdi" => if crate::capture::in_remote_desktop() { "COMPAT CAPTURE (REMOTE DESKTOP) · " } else { "COMPAT CAPTURE · " },
                     _ => "",
