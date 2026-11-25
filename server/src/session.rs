@@ -51,6 +51,8 @@ struct Shared {
     out: tokio::sync::mpsc::UnboundedSender<Ctrl>,
     /// Direct or relayed, from the local Tailscale.
     path: proto::tailscale::PathWatcher,
+    /// Mouse and keyboard injection (the video thread updates its screen when the size changes).
+    input: Input,
     stop: Arc<AtomicBool>,
     status: Arc<Status>,
 }
@@ -344,12 +346,22 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         list: ms.iter().map(|m| proto::ctrl::MonitorDesc { width: m.width as u16, height: m.height as u16, primary: m.left == 0 && m.top == 0 }).collect(),
     };
     out_tx.send(describe(&monitors, current))?;
-    let shared = Arc::new(Shared { force_idr: AtomicBool::new(true), invalidate: Mutex::new(None), monitor: Mutex::new(s.monitor.clone()), switch: AtomicBool::new(false), out: out_tx.clone(), path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()), stop: stop.clone(), status });
+    let input = Input::new(s.monitor.clone());
+    let shared = Arc::new(Shared {
+        force_idr: AtomicBool::new(true),
+        invalidate: Mutex::new(None),
+        monitor: Mutex::new(s.monitor.clone()),
+        switch: AtomicBool::new(false),
+        out: out_tx.clone(),
+        path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()),
+        input: input.clone(),
+        stop: stop.clone(),
+        status,
+    });
     let video = {
         let (conn, s, shared) = (conn.clone(), s.clone(), shared.clone());
         std::thread::Builder::new().name("video".into()).spawn(move || video_thread(conn, s, shared))?
     };
-    let input = Input::new(s.monitor.clone());
 
     let writer = async {
         while let Some(m) = out_rx.recv().await {
@@ -449,6 +461,19 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
     }
 }
 
+/// The shown screen as Windows describes it now, if its position or size differs from
+/// `shared.monitor` (resolution changed, monitor plugged in or out). Gone: the first screen.
+fn changed_monitor(shared: &Shared) -> Option<MonitorInfo> {
+    let list = crate::capture::list_monitors().ok()?;
+    let cur = shared.monitor.lock().unwrap().clone();
+    let fresh = list.iter().find(|m| m.device_name == cur.device_name).or(list.first())?.clone();
+    if (fresh.width, fresh.height, fresh.left, fresh.top) == (cur.width, cur.height, cur.left, cur.top) && fresh.device_name == cur.device_name {
+        return None;
+    }
+    println!("screen changed: {} {}x{} -> {} {}x{}", cur.device_name, cur.width, cur.height, fresh.device_name, fresh.width, fresh.height);
+    Some(fresh)
+}
+
 fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let mut frame_id: u32 = 0;
     // Adaptive bitrate: the configured bitrate is the ceiling (see rate.rs).
@@ -466,12 +491,17 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     let mut lost_prev = conn.stats().path.lost_packets;
     let mut sent_prev = conn.stats().path.sent_packets;
     let mut desktop_check = Instant::now();
+    let mut display_check = Instant::now();
 
     'pipeline: while !shared.stop.load(Ordering::Acquire) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
         shared.switch.store(false, Ordering::Release);
         crate::desktop::follow_input_desktop();
+        if let Some(m) = changed_monitor(&shared) {
+            shared.input.set_monitor(m.clone());
+            *shared.monitor.lock().unwrap() = m;
+        }
         let mon = shared.monitor.lock().unwrap().clone();
         let mut p = match Pipeline::new(mon.clone(), s.fps, rate.video_bps()) {
             Ok(p) => {
@@ -509,6 +539,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             }
             // GDI capture gets no "desktop changed" error like Desktop Duplication does, so look
             // for a switch (lock screen, UAC; only visible as SYSTEM) every 250 ms.
+            // GDI capture doesn't notice a new screen size either (e.g. a monitor plugged into a
+            // PC that had none): look every 2 s and rebuild for the new size.
+            if p.capture_mode() == "gdi" && display_check.elapsed() >= Duration::from_secs(2) {
+                display_check = Instant::now();
+                if changed_monitor(&shared).is_some() {
+                    continue 'pipeline;
+                }
+            }
             if p.capture_mode() == "gdi" && desktop_check.elapsed() >= Duration::from_millis(250) {
                 desktop_check = Instant::now();
                 if crate::desktop::follow_input_desktop() {
@@ -542,6 +580,7 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 );
                 let enc_avg = enc.split('/').next().unwrap_or("-").to_string();
                 let mode = match p.capture_mode() {
+                    "gdi" if p.fell_back() => "NO ACTIVE MONITOR: COMPAT CAPTURE · ",
                     "gdi" => if crate::capture::in_remote_desktop() { "COMPAT CAPTURE (REMOTE DESKTOP) · " } else { "COMPAT CAPTURE · " },
                     _ => "",
                 };

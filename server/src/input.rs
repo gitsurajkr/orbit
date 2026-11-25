@@ -155,7 +155,8 @@ enum Cmd {
     ReleaseAll,
 }
 
-/// Queues input for the injection thread; the thread ends when this is dropped.
+/// Queues input for the injection thread; the thread ends when the last clone is dropped.
+#[derive(Clone)]
 pub struct Input {
     tx: std::sync::mpsc::Sender<Cmd>,
 }

@@ -9,14 +9,24 @@
 //! simply get the newest image next time.
 //!
 //! Where Windows refuses Desktop Duplication (Remote Desktop session, screen on another GPU,
-//! basic display driver) the pipeline falls back to GDI capture (`COMPAT CAPTURE`).
+//! basic display driver) the pipeline falls back to GDI capture (`COMPAT CAPTURE`). So it does
+//! when Duplication starts but never delivers an image: a PC with no monitor attached (or one
+//! switched off) shows Windows' 1024x768 stand-in display, which the GPU doesn't draw, so the
+//! viewer stayed black. GDI copies the desktop the way UltraViewer and the like do and works
+//! there. Meanwhile Duplication is retried every [`PROBE_EVERY`], and used again once it works.
 
 use crate::capture::{find_adapter, in_remote_desktop, is_duplication_unsupported, Bridge, Duplicator, GdiCapture, Gpu, Grab, MonitorInfo, NVIDIA_VENDOR};
 use crate::nvenc::{Encoder, EncoderConfig};
 use anyhow::{Context, Result};
 use proto::clock::now_us;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+
+/// Desktop Duplication's first image normally arrives at once; none after this means the
+/// display isn't being drawn.
+const FIRST_FRAME_WITHIN: Duration = Duration::from_secs(2);
+/// While on the GDI fallback, how often to try Desktop Duplication again.
+const PROBE_EVERY: Duration = Duration::from_secs(10);
 
 enum Source {
     /// Desktop Duplication on the encoder's GPU (zero-copy).
@@ -37,6 +47,10 @@ pub struct Pipeline {
     mon: MonitorInfo,
     /// True once `tex` holds a real image (so a keyframe request can re-encode it).
     have_image: bool,
+    started: Instant,
+    /// On GDI because Desktop Duplication delivered nothing (see the module docs).
+    fell_back: bool,
+    last_probe: Instant,
 }
 
 pub struct Encoded {
@@ -86,7 +100,8 @@ impl Pipeline {
                 Source::Gdi(GdiCapture::new(mon.clone())?)
             }
         };
-        Ok(Pipeline { gpu, tex, source, enc, mon, have_image: false })
+        let now = Instant::now();
+        Ok(Pipeline { gpu, tex, source, enc, mon, have_image: false, started: now, fell_back: false, last_probe: now })
     }
 
     pub fn monitor(&self) -> &MonitorInfo {
@@ -107,6 +122,44 @@ impl Pipeline {
         self.enc.supports_rfi()
     }
 
+    /// On the GDI fallback because the display isn't being drawn (no monitor attached?).
+    pub fn fell_back(&self) -> bool {
+        self.fell_back
+    }
+
+    /// Desktop Duplication has delivered nothing since the start: switch to GDI. On the
+    /// fallback, try Duplication again now and then (a monitor switched back on).
+    fn check_fallback(&mut self) {
+        let duplicating = matches!(self.source, Source::Dup(_) | Source::BridgedDup(..));
+        if duplicating && !self.have_image && self.started.elapsed() >= FIRST_FRAME_WITHIN {
+            match GdiCapture::new(self.mon.clone()) {
+                Ok(g) => {
+                    println!(
+                        "screen capture: no image from {} ({}x{}) in {} s: the display isn't being drawn (no monitor attached, or it's off?). Using compatible capture.",
+                        self.mon.device_name,
+                        self.mon.width,
+                        self.mon.height,
+                        FIRST_FRAME_WITHIN.as_secs()
+                    );
+                    self.source = Source::Gdi(g);
+                    self.fell_back = true;
+                    self.last_probe = Instant::now();
+                }
+                Err(e) => eprintln!("screen capture: compatible capture failed too: {e:#}"),
+            }
+        } else if self.fell_back && self.mon.vendor == NVIDIA_VENDOR && self.last_probe.elapsed() >= PROBE_EVERY {
+            self.last_probe = Instant::now();
+            // A new duplication hands over the current image at once if the display is drawn.
+            if let Ok(mut d) = Duplicator::new(&self.gpu, self.mon.clone()) {
+                if matches!(d.grab(&self.gpu, 100, &self.tex), Ok(Grab::Frame)) {
+                    println!("screen capture: {} is being drawn again; back to fast capture", self.mon.device_name);
+                    self.source = Source::Dup(d);
+                    self.fell_back = false;
+                }
+            }
+        }
+    }
+
     /// True when frames take an extra copy (cross-GPU or GDI).
     pub fn bridged(&self) -> bool {
         !matches!(self.source, Source::Dup(_))
@@ -125,6 +178,7 @@ impl Pipeline {
     /// With `force_idr` (keyframe) or `force_frame` (recovery frame) and no change, re-encodes
     /// the last image right away, so a repair never waits for the screen to change.
     pub fn next(&mut self, timeout_ms: u32, force_idr: bool, force_frame: bool, out: &mut Vec<u8>) -> Result<Option<Encoded>> {
+        self.check_fallback();
         let force_idr_or_frame = force_idr || force_frame;
         let wait = if force_idr_or_frame && self.have_image { 0 } else { timeout_ms };
         let mut copy_ms = 0.0;
