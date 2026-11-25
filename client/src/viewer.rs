@@ -305,16 +305,26 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 fn create_window(video_w: u32, video_h: u32) -> Result<HWND> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
-        let class = WNDCLASSW {
+        // ORBIT's logo, embedded in orbit.exe as icon resource 1 (app/build.rs), in the sizes the
+        // title bar and the taskbar/Alt+Tab want. Missing (e.g. orbit-client.exe): Windows' default.
+        let icon = |metric_x, metric_y| {
+            LoadImageW(instance, windows::core::PCWSTR(1 as _), IMAGE_ICON, GetSystemMetrics(metric_x), GetSystemMetrics(metric_y), LR_DEFAULTCOLOR)
+                .map(|h| HICON(h.0))
+                .unwrap_or_default()
+        };
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
+            hIcon: icon(SM_CXICON, SM_CYICON),
+            hIconSm: icon(SM_CXSMICON, SM_CYSMICON),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             lpszClassName: w!("orbit"),
             ..Default::default()
         };
-        RegisterClassW(&class);
+        RegisterClassExW(&class);
         // Fit the remote screen into 90% of this monitor's work area, keeping its shape.
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY), &mut mi);
