@@ -571,6 +571,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             }
         };
         let mut need_idr = true;
+        // A fresh encoder gives keyframes extra room; on a path that just lost packets, don't.
+        let mut small_keyframes = false;
+        if rate.recently_lossy() {
+            small_keyframes = true;
+            if let Err(e) = p.encoder().set_bitrate(rate.video_bps(), true) {
+                eprintln!("set bitrate: {e:#}");
+            }
+        }
         // (frame id, capture time = NVENC timestamp) of the frames sent since the last keyframe
         // that the encoder still holds as references, oldest first.
         let mut refs: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
@@ -611,13 +619,21 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
                 let (fps, mbit, enc, rtt) = (frames as f64 / secs, mbit_per_s(bytes, secs), enc_ms.take(), conn.rtt().as_secs_f64() * 1e3);
                 let wait_ms = net_wait.as_secs_f64() * 1e3;
                 let lost = st.path.lost_packets - lost_prev;
-                let report = Report { rtt: conn.rtt(), sent_packets: st.path.sent_packets - sent_prev, lost_packets: lost, net_wait: net_wait.as_secs_f64() / secs };
+                let report = Report {
+                    rtt: conn.rtt(),
+                    sent_packets: st.path.sent_packets - sent_prev,
+                    lost_packets: lost,
+                    net_wait: net_wait.as_secs_f64() / secs,
+                    sent_bps: (bytes as f64 * 8.0 / secs) as u64,
+                };
                 let old_video = rate.video_bps();
                 let new_bps = rate.update(&report);
                 backlog_limit = backlog_limit_for(new_bps);
                 let new_video = rate.video_bps();
-                if new_video != old_video {
-                    if let Err(e) = p.encoder().set_bitrate(new_video) {
+                let small = rate.recently_lossy();
+                if new_video != old_video || small != small_keyframes {
+                    small_keyframes = small;
+                    if let Err(e) = p.encoder().set_bitrate(new_video, small) {
                         eprintln!("set bitrate {new_video}: {e:#}");
                     }
                 }

@@ -12,11 +12,18 @@
 //! | condition                                              | action                  |
 //! |--------------------------------------------------------|-------------------------|
 //! | RTT > 3×best + 100 ms, or net wait > 50 %              | ×0.5                    |
+//! | loss > 10 % (an overflowing link: get under it now)    | ×0.5                    |
 //! | loss > 5 %, loss two seconds running, RTT > 2×best +   | ×0.8                    |
 //! | 15 ms, or net wait > 10 %                              |                         |
 //! | one stray lost packet                                  | hold (burst, not a cap) |
 //! | RTT > 1.5×best + 8 ms                                  | ×0.9                    |
+//! | clean, but less than half the rate was used (idle)     | stay: proves nothing    |
 //! | clean                                                  | climb (see below)       |
+//!
+//! A session starts at [`START_BPS`] (or the configured maximum, if lower) and only climbs on
+//! seconds that actually carried traffic. Idle seconds used to count as clean, so after a still
+//! screen the rate sat at the maximum without ever having carried it; the next burst of screen
+//! changes then overflowed a slow path (a Tailscale relay: 30-70 % loss, 4 s freezes).
 //!
 //! After a cut: wait [`HOLD`] clean seconds, then climb +10 % per second, but only up to 90 %
 //! of the rate where trouble happened; above that, probe slowly (+1 % of max per second). The
@@ -31,6 +38,15 @@ use std::time::Duration;
 
 /// Never go below this (a 1080p desktop is still readable at 1 Mbit/s).
 pub const MIN_BPS: u32 = 1_000_000;
+/// Where a session starts: good quality on any path, and a few seconds of real traffic climb
+/// from here to the configured maximum where the path allows it.
+pub const START_BPS: u32 = 10_000_000;
+/// A second that sent less than this fraction of the video rate is idle: it doesn't prove the rate.
+const BUSY: f64 = 0.5;
+/// Loss above this halves the rate at once.
+const HEAVY_LOSS: f64 = 0.10;
+/// Seconds after the last loss during which the path counts as lossy (see `recently_lossy`).
+const LOSSY_FOR: u32 = 10;
 /// Seconds of RTT history for the "best RTT" baseline.
 const RTT_WINDOW: usize = 10;
 /// Clean seconds to wait after a cut before climbing.
@@ -52,6 +68,8 @@ pub struct Report {
     pub lost_packets: u64,
     /// Fraction (0..=1) of the second spent waiting for the send queue.
     pub net_wait: f64,
+    /// Video bits actually sent in that second (before FEC).
+    pub sent_bps: u64,
 }
 
 pub struct RateControl {
@@ -64,13 +82,32 @@ pub struct RateControl {
     clean: u32,
     reason: &'static str,
     fec: u32,
+    /// Seconds since the last second with a lost packet.
+    since_loss: u32,
 }
 
 impl RateControl {
-    /// Starts at `max_bps` (the configured bitrate is the ceiling).
+    /// Starts at [`START_BPS`] or `max_bps`, whichever is lower (the configured bitrate is the ceiling).
     pub fn new(max_bps: u32) -> Self {
         let max = max_bps.max(MIN_BPS);
-        RateControl { bps: max, max, rtts: VecDeque::new(), lossy_prev: false, hold: 0, trouble_at: None, clean: 0, reason: "start", fec: FEC_START }
+        RateControl {
+            bps: max.min(START_BPS),
+            max,
+            rtts: VecDeque::new(),
+            lossy_prev: false,
+            hold: 0,
+            trouble_at: None,
+            clean: 0,
+            reason: "start",
+            fec: FEC_START,
+            since_loss: LOSSY_FOR,
+        }
+    }
+
+    /// A packet was lost in the last [`LOSSY_FOR`] seconds: keep keyframes small (a big one is
+    /// likely to be lost again on such a path).
+    pub fn recently_lossy(&self) -> bool {
+        self.since_loss < LOSSY_FOR
     }
 
     /// Total bitrate on the wire (video + FEC parity).
@@ -88,8 +125,8 @@ impl RateControl {
         (self.bps as u64 * 100 / (100 + self.fec) as u64) as u32
     }
 
-    /// Why the rate is what it is, for stats: start, queue, loss, net wait, rtt, burst, hold,
-    /// climb, probe, max.
+    /// Why the rate is what it is, for stats: start, queue, heavy loss, loss, net wait, rtt,
+    /// burst, idle, hold, climb, probe, max.
     pub fn reason(&self) -> &'static str {
         self.reason
     }
@@ -105,8 +142,12 @@ impl RateControl {
         let loss = if r.sent_packets > 0 { r.lost_packets as f64 / r.sent_packets as f64 } else { 0.0 };
         let lossy = r.lost_packets > 0;
 
+        let idle = (r.sent_bps as f64) < self.video_bps() as f64 * BUSY;
+
         if r.rtt > best * 3 + ms(100) || r.net_wait > 0.5 {
             self.cut(0.5, if r.net_wait > 0.5 { "net wait" } else { "queue" });
+        } else if loss > HEAVY_LOSS {
+            self.cut(0.5, "heavy loss");
         } else if loss > 0.05 || (lossy && self.lossy_prev) {
             self.cut(0.8, "loss");
         } else if r.net_wait > 0.1 {
@@ -117,10 +158,13 @@ impl RateControl {
             self.reason = "burst"; // one stray loss: keep the rate, don't count as clean
         } else if r.rtt.as_secs_f64() > best.as_secs_f64() * 1.5 + 0.008 {
             self.cut(0.9, "rtt");
+        } else if idle {
+            self.reason = "idle"; // nothing to learn: keep the rate, don't count as clean
         } else {
             self.climb();
         }
         self.lossy_prev = lossy;
+        self.since_loss = if lossy { 0 } else { (self.since_loss + 1).min(LOSSY_FOR) };
         self.fec = if lossy { (self.fec + FEC_UP).min(FEC_MAX) } else { self.fec.saturating_sub(FEC_DOWN).max(FEC_MIN) };
         self.bps
     }
@@ -162,8 +206,20 @@ mod tests {
 
     const M: u32 = 1_000_000;
 
+    /// A second that used the whole rate (busy): only such seconds can prove a rate.
     fn rep(rtt_ms: u64, sent: u64, lost: u64, wait: f64) -> Report {
-        Report { rtt: Duration::from_millis(rtt_ms), sent_packets: sent, lost_packets: lost, net_wait: wait }
+        Report { rtt: Duration::from_millis(rtt_ms), sent_packets: sent, lost_packets: lost, net_wait: wait, sent_bps: u64::MAX / 2 }
+    }
+
+    fn idle(rtt_ms: u64) -> Report {
+        Report { sent_bps: 200_000, ..rep(rtt_ms, 50, 0, 0.0) }
+    }
+
+    /// Already at `max` (as if it had climbed there under load).
+    fn warm(max: u32) -> RateControl {
+        let mut r = RateControl::new(max);
+        r.bps = max;
+        r
     }
 
     fn clean(rtt_ms: u64) -> Report {
@@ -172,7 +228,7 @@ mod tests {
 
     #[test]
     fn stays_at_max_on_a_clean_path() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         for _ in 0..20 {
             assert_eq!(r.update(&clean(90)), 20 * M);
         }
@@ -181,7 +237,7 @@ mod tests {
 
     #[test]
     fn halves_when_a_queue_builds() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         r.update(&clean(90));
         assert_eq!(r.update(&clean(400)), 10 * M); // 400 > 3*90 + 100
         assert_eq!(r.reason(), "queue");
@@ -191,7 +247,7 @@ mod tests {
 
     #[test]
     fn one_stray_loss_holds_two_in_a_row_cut() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         r.update(&clean(90));
         assert_eq!(r.update(&rep(90, 1000, 1, 0.0)), 20 * M);
         assert_eq!(r.reason(), "burst");
@@ -201,13 +257,13 @@ mod tests {
 
     #[test]
     fn heavy_loss_cuts_at_once() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         assert_eq!(r.update(&rep(90, 1000, 80, 0.0)), 16 * M);
     }
 
     #[test]
     fn creeping_rtt_backs_off_gently() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         r.update(&clean(90));
         assert_eq!(r.update(&clean(150)), 18 * M); // > 1.5*90+8, < 2*90+15
         assert_eq!(r.reason(), "rtt");
@@ -215,7 +271,7 @@ mod tests {
 
     #[test]
     fn after_a_cut_holds_then_climbs_to_90_percent_of_trouble() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         r.update(&clean(90));
         r.update(&rep(90, 1000, 100, 0.0)); // 20 -> 16, trouble at 20
         for _ in 0..HOLD {
@@ -230,7 +286,7 @@ mod tests {
 
     #[test]
     fn trouble_rate_is_forgotten_after_clean_period() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         r.update(&clean(90));
         r.update(&rep(90, 1000, 100, 0.0));
         for _ in 0..FORGET {
@@ -241,7 +297,7 @@ mod tests {
 
     #[test]
     fn never_below_minimum() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         for _ in 0..30 {
             r.update(&rep(90, 1000, 0, 0.9));
         }
@@ -250,7 +306,7 @@ mod tests {
 
     #[test]
     fn fec_follows_loss_within_bounds() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         assert_eq!(r.fec_percent(), 15);
         assert_eq!(r.video_bps(), 20 * M * 100 / 115);
         r.update(&rep(90, 1000, 1, 0.0));
@@ -267,9 +323,59 @@ mod tests {
 
     #[test]
     fn lan_jitter_is_not_congestion() {
-        let mut r = RateControl::new(20 * M);
+        let mut r = warm(20 * M);
         for rtt in [1, 2, 1, 3, 2, 1, 4, 2] {
             assert_eq!(r.update(&clean(rtt)), 20 * M); // 4 ms < 1.5*1 + 8
         }
+    }
+
+    #[test]
+    fn starts_at_start_rate_and_climbs_only_under_load() {
+        let mut r = RateControl::new(20 * M);
+        assert_eq!(r.bps(), START_BPS);
+        assert_eq!(RateControl::new(4 * M).bps(), 4 * M, "a lower maximum is the start");
+        for _ in 0..20 {
+            r.update(&idle(90));
+        }
+        assert_eq!(r.bps(), START_BPS, "idle seconds prove nothing");
+        assert_eq!(r.reason(), "idle");
+        for _ in 0..20 {
+            r.update(&clean(90));
+        }
+        assert_eq!(r.bps(), 20 * M, "busy clean seconds climb to the maximum");
+    }
+
+    #[test]
+    fn a_still_screen_does_not_climb_back_after_trouble() {
+        // The relay freeze: cut to ~5 Mbit/s by loss, then a still screen for a minute.
+        let mut r = warm(20 * M);
+        r.update(&rep(90, 1000, 300, 0.0));
+        let after_cut = r.bps();
+        for _ in 0..60 {
+            r.update(&idle(90));
+        }
+        assert_eq!(r.bps(), after_cut, "must not sit at the maximum it never carried");
+    }
+
+    #[test]
+    fn heavy_loss_halves_at_once() {
+        let mut r = warm(20 * M);
+        assert_eq!(r.update(&rep(90, 1000, 333, 0.0)), 10 * M);
+        assert_eq!(r.reason(), "heavy loss");
+        assert_eq!(r.update(&rep(90, 1000, 80, 0.0)), 8 * M, "5-10 % loss: the gentler cut");
+    }
+
+    #[test]
+    fn lossy_for_a_while_after_a_loss() {
+        let mut r = warm(20 * M);
+        assert!(!r.recently_lossy());
+        r.update(&rep(90, 1000, 1, 0.0));
+        assert!(r.recently_lossy());
+        for _ in 0..LOSSY_FOR - 1 {
+            r.update(&clean(90));
+            assert!(r.recently_lossy());
+        }
+        r.update(&clean(90));
+        assert!(!r.recently_lossy());
     }
 }

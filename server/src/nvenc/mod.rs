@@ -340,8 +340,10 @@ impl Encoder {
         Ok(EncodedFrame { keyframe, qp })
     }
 
-    /// Changes the bitrate on the fly (no new keyframe needed).
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    /// Changes the bitrate on the fly (no new keyframe needed). `small_keyframes`: give keyframes
+    /// no extra room (a lossy path: a big keyframe would likely be lost again, and with it the
+    /// repair).
+    pub fn set_bitrate(&mut self, bps: u32, small_keyframes: bool) -> Result<()> {
         self.cfg.bitrate_bps = bps;
         unsafe {
             let rc = &mut self.config.rcParams;
@@ -349,7 +351,7 @@ impl Encoder {
             rc.maxBitRate = bps;
             rc.vbvBufferSize = bps / self.cfg.fps.max(1);
             rc.vbvInitialDelay = rc.vbvBufferSize;
-            rc.lowDelayKeyFrameScale = keyframe_scale(bps, self.cfg.fps);
+            rc.lowDelayKeyFrameScale = if small_keyframes { 1 } else { keyframe_scale(bps, self.cfg.fps) };
             let mut re: NV_ENC_RECONFIGURE_PARAMS = zeroed();
             re.version = RECONFIGURE_VER;
             re.reInitEncodeParams = *self.init;
