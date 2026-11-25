@@ -73,6 +73,11 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
 
     let hwnd = create_window(session.width, session.height)?;
     let (cw, ch) = client_size(hwnd);
+    // Our picture area, for a sharing PC that shows ORBIT's virtual display: it sizes that to
+    // match, so the picture needs no scaling. Sent now and after each resize settles.
+    let view_size = |w: u32, h: u32| Ctrl::ViewSize { width: w.min(u16::MAX as u32) as u16, height: h.min(u16::MAX as u32) as u16 };
+    let _ = session.ctrl.send(view_size(cw, ch));
+    let mut resize_settling: Option<((u32, u32), Instant)> = None;
     let mut renderer = render::Renderer::new(hwnd, cw, ch)?;
     let mut decoder = decode::Decoder::new(&renderer.device)?;
     println!("display: tearing {} | Ctrl+Alt+Enter toggles fullscreen", if renderer.tearing() { "on (no vsync wait)" } else { "unavailable (vsync)" });
@@ -159,6 +164,14 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
         }
         if let Some((w, h)) = SINK.with(|s| s.borrow_mut().as_mut().and_then(|s| s.resized.take())) {
             renderer.resize(w, h)?;
+            resize_settling = Some(((w, h), Instant::now()));
+        }
+        // Dragging a window edge resizes many times a second: report the size once it rests.
+        if let Some(((w, h), at)) = resize_settling {
+            if at.elapsed() >= Duration::from_millis(600) {
+                resize_settling = None;
+                let _ = session.ctrl.send(view_size(w, h));
+            }
         }
 
         // Decode everything that arrived (each delta frame is needed as a reference for the
@@ -330,6 +343,10 @@ fn create_window(video_w: u32, video_h: u32) -> Result<HWND> {
         let _ = GetMonitorInfoW(MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY), &mut mi);
         let (aw, ah) = ((mi.rcWork.right - mi.rcWork.left) as u32 * 9 / 10, (mi.rcWork.bottom - mi.rcWork.top) as u32 * 9 / 10);
         let r = render::fit(video_w, video_h, aw.min(video_w), ah.min(video_h));
+        // A remote screen as big as this one would only be shrunk into a window: use the whole
+        // screen. (Showing ORBIT's virtual display, the sharing PC then matches this size exactly.)
+        let work = (mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top);
+        let maximize = video_w as i32 >= work.0 || video_h as i32 >= work.1;
         let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
         let mut wr = RECT { left: 0, top: 0, right: r.right - r.left, bottom: r.bottom - r.top };
         AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE::default())?;
@@ -347,6 +364,9 @@ fn create_window(video_w: u32, video_h: u32) -> Result<HWND> {
             instance,
             None,
         )?;
+        if maximize {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
         // Black title bar to match the app's theme.
         let dark: BOOL = true.into();
         let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(

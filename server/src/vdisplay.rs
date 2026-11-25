@@ -183,7 +183,7 @@ impl Driver {
         if reply.status != 0 {
             bail!("the ORBIT Display driver couldn't add a {width}x{height}@{hz} monitor: {} failed (0x{:08X})", step_name(reply.step), reply.status as u32);
         }
-        Ok(VirtualMonitor { driver: self.clone(), slot: reply.slot, before, closed: false })
+        Ok(VirtualMonitor { driver: self.clone(), slot: reply.slot, before, mode: (width & !1, height & !1, if hz == 0 { 60 } else { hz }), closed: false })
     }
 
     /// Bit i set = slot i holds a monitor (any owner).
@@ -204,6 +204,8 @@ pub struct VirtualMonitor {
     slot: u32,
     /// ORBIT Display targets that existed before this one was added.
     before: Vec<TargetKey>,
+    /// The mode it was asked for (width, height, Hz).
+    mode: (u32, u32, u32),
     closed: bool,
 }
 
@@ -214,13 +216,21 @@ impl VirtualMonitor {
 
     /// Waits until Windows shows the monitor and returns its GDI name (`\\.\DISPLAYn`). If Windows
     /// adds it but leaves it off (a saved "show only on 1" layout), the desktop is switched to
-    /// Extend once, since a monitor was asked for.
+    /// Extend once, since a monitor was asked for. Once on, it gets the mode it was asked for:
+    /// Windows remembers a resolution per monitor and may restore an old one.
     pub fn wait_active(&self, timeout: Duration) -> Result<String> {
         let start = Instant::now();
         let mut extended = false;
         loop {
             let new: Vec<Target> = orbit_targets_full().into_iter().filter(|t| !self.before.contains(&t.key)).collect();
-            if let Some(name) = new.iter().find_map(|t| t.gdi_name.clone()) {
+            if let Some(t) = new.iter().find(|t| t.gdi_name.is_some()) {
+                let name = t.gdi_name.clone().expect("checked");
+                if t.alone {
+                    set_mode(&name, self.mode);
+                } else {
+                    // Mirroring another screen: a new mode would change that screen too.
+                    println!("virtual display: {name} mirrors another screen; leaving its mode alone");
+                }
                 return Ok(name);
             }
             if !extended && !new.is_empty() && start.elapsed() > Duration::from_secs(2) {
@@ -299,6 +309,8 @@ struct Target {
     key: TargetKey,
     /// `\\.\DISPLAYn` while it's part of the desktop.
     gdi_name: Option<String>,
+    /// Its desktop isn't also shown on another screen (no "Duplicate").
+    alone: bool,
 }
 
 fn orbit_targets() -> Vec<TargetKey> {
@@ -336,7 +348,7 @@ fn orbit_targets_full() -> Vec<Target> {
                 if DisplayConfigGetDeviceInfo(&mut name.header) != 0 || wide(&name.monitorFriendlyDeviceName) != MONITOR_NAME {
                     continue;
                 }
-                found.push(Target { key, gdi_name: None });
+                found.push(Target { key, gdi_name: None, alone: true });
             }
             let entry = found.iter_mut().find(|f| f.key == key).expect("just added");
             if active && entry.gdi_name.is_none() {
@@ -348,10 +360,46 @@ fn orbit_targets_full() -> Vec<Target> {
                 if DisplayConfigGetDeviceInfo(&mut source.header) == 0 {
                     entry.gdi_name = Some(wide(&source.viewGdiDeviceName));
                 }
+                // Other active paths showing the same source mirror this desktop.
+                let src = (p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id);
+                entry.alone = !paths[..paths_n as usize].iter().any(|o| {
+                    o.flags & windows::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_ACTIVE != 0
+                        && (o.sourceInfo.adapterId.LowPart, o.sourceInfo.adapterId.HighPart, o.sourceInfo.id) == src
+                        && (o.targetInfo.adapterId.LowPart, o.targetInfo.adapterId.HighPart, o.targetInfo.id) != key
+                });
             }
         }
     }
     found
+}
+
+/// Sets `name` to `mode` (width, height, Hz) unless it's already there, and waits (up to 2 s) for
+/// Windows to apply it. Saved per monitor, so the same monitor comes back in that mode.
+fn set_mode(name: &str, (width, height, hz): (u32, u32, u32)) {
+    use windows::Win32::Graphics::Gdi::*;
+    let device = windows::core::HSTRING::from(name);
+    let current = || unsafe {
+        let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+        EnumDisplaySettingsW(&device, ENUM_CURRENT_SETTINGS, &mut dm).as_bool().then_some(dm)
+    };
+    let Some(mut dm) = current() else { return };
+    if (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency) == (width, height, hz) {
+        return;
+    }
+    let was = (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
+    dm.dmPelsWidth = width;
+    dm.dmPelsHeight = height;
+    dm.dmDisplayFrequency = hz;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    let rc = unsafe { ChangeDisplaySettingsExW(&device, Some(&dm), None, CDS_UPDATEREGISTRY, None) };
+    println!("virtual display: {name} was {}x{}@{}, set to {width}x{height}@{hz} (result {})", was.0, was.1, was.2, rc.0);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if current().is_some_and(|d| (d.dmPelsWidth, d.dmPelsHeight) == (width, height)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// GDI names of the ORBIT Display monitors that are on right now.

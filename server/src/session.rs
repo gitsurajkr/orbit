@@ -53,6 +53,8 @@ struct Shared {
     path: proto::tailscale::PathWatcher,
     /// Mouse and keyboard injection (the video thread updates its screen when the size changes).
     input: Input,
+    /// The viewer's picture area (Ctrl::ViewSize): the size for ORBIT's virtual display.
+    view_size: Mutex<Option<(u32, u32)>>,
     stop: Arc<AtomicBool>,
     status: Arc<Status>,
 }
@@ -355,6 +357,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
         out: out_tx.clone(),
         path: proto::tailscale::PathWatcher::start(conn.remote_address().ip()),
         input: input.clone(),
+        view_size: Mutex::new(None),
         stop: stop.clone(),
         status,
     });
@@ -426,6 +429,7 @@ async fn session(conn: Connection, s: Settings, stop: Arc<AtomicBool>, status: A
                     }
                     out_tx.send(describe(&monitors, current))?;
                 }
+                Ctrl::ViewSize { width, height } => *shared.view_size.lock().unwrap() = Some((width as u32, height as u32)),
                 c @ (Ctrl::Key { .. } | Ctrl::MouseButton { .. } | Ctrl::Wheel { .. }) => input.handle(c),
                 other => bail!("unexpected {other:?}"),
             }
@@ -474,28 +478,54 @@ fn changed_monitor(shared: &Shared) -> Option<MonitorInfo> {
     Some(fresh)
 }
 
-/// Stable serial for ORBIT's virtual monitor: Windows keeps its settings (resolution, scaling)
-/// from one session to the next.
-const VIRTUAL_DISPLAY_SERIAL: u32 = 0x0B17_0001;
+/// The virtual monitor's serial for a size: one per size. Windows keeps settings per monitor
+/// (by serial) and restores them when it comes back, so with a single serial a monitor made at a
+/// new size came back at the old one (seen: asked 1606x978, Windows restored 1920x990, and
+/// changing it after the fact failed). Per size, each monitor's remembered mode is its own.
+fn virtual_serial(width: u32, height: u32, hz: u32) -> u32 {
+    let mut h: u32 = 0x811C_9DC5; // FNV-1a
+    for b in [width.to_le_bytes(), height.to_le_bytes(), hz.to_le_bytes()].concat() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// The size for ORBIT's virtual display: the viewer's picture area (so its pixels map 1:1 onto the
+/// viewer's screen), within what the driver accepts; 1920x1080 until the viewer has said. The width
+/// is rounded down to a multiple of 8 and the height to an even number (what display hardware
+/// commonly requires); the viewer shows a picture a few pixels smaller 1:1 with a thin edge.
+fn virtual_size(shared: &Shared) -> (u32, u32) {
+    match *shared.view_size.lock().unwrap() {
+        Some((w, h)) => ((w & !7).clamp(640, 7680), (h & !1).clamp(480, 4320)),
+        None => (1920, 1080),
+    }
+}
 
 /// No monitor is attached (nothing is drawn, so Desktop Duplication gets no image): add an ORBIT
-/// Display virtual monitor, drawn by the encoder's GPU, refreshing at the session's frame rate
-/// (60-144 Hz: a 120 fps setting gets a 120 Hz screen, so new pictures exist that often), and make
-/// it the shown screen. None if the
+/// Display virtual monitor, drawn by the encoder's GPU, sized to the viewer's picture area,
+/// refreshing at the session's frame rate (60-144 Hz: a 120 fps setting gets a 120 Hz screen, so
+/// new pictures exist that often), and make it the shown screen. None if the
 /// driver isn't installed or usable (then the GDI fallback stays). The monitor is removed when the
 /// returned value is dropped, i.e. when the session ends.
 fn switch_to_virtual_display(shared: &Shared, fps: u32) -> Option<crate::vdisplay::VirtualMonitor> {
     let hz = fps.clamp(60, 144);
+    let (width, height) = virtual_size(shared);
     let attempt = || -> anyhow::Result<(crate::vdisplay::VirtualMonitor, MonitorInfo)> {
         let driver = crate::vdisplay::Driver::open()?;
         let gpu = crate::capture::find_adapter(crate::capture::NVIDIA_VENDOR)?.and_then(|(i, _)| crate::capture::adapter_luid(i).ok());
-        let monitor = driver.add(1920, 1080, hz, VIRTUAL_DISPLAY_SERIAL, gpu)?;
+        let monitor = driver.add(width, height, hz, virtual_serial(width, height, hz), gpu)?;
         let name = monitor.wait_active(Duration::from_secs(10))?;
-        let info = crate::capture::list_monitors()?
-            .into_iter()
-            .find(|m| m.device_name.eq_ignore_ascii_case(&name))
-            .ok_or_else(|| anyhow::anyhow!("{name} is on but not listed"))?;
-        Ok((monitor, info))
+        // Windows announces a new screen to GDI a moment before DXGI lists it.
+        let listed = Instant::now();
+        loop {
+            if let Some(info) = crate::capture::list_monitors()?.into_iter().find(|m| m.device_name.eq_ignore_ascii_case(&name)) {
+                return Ok((monitor, info));
+            }
+            if listed.elapsed() > Duration::from_secs(3) {
+                anyhow::bail!("{name} is on but not listed");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     };
     match attempt() {
         Ok((monitor, info)) => {
@@ -515,9 +545,13 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
     // Declared first, so it outlives every pipeline that captures it (dropped last: removed after).
     let mut virtual_display: Option<crate::vdisplay::VirtualMonitor> = None;
     let mut virtual_tried = false;
+    // Size the virtual display was made at; a different viewer size re-creates it.
+    let mut virtual_made_at = (0, 0);
+    let mut resize_virtual = false;
     // ORBIT_VIRTUAL_DISPLAY=1: use the virtual monitor even with a monitor attached (testing).
     if std::env::var_os("ORBIT_VIRTUAL_DISPLAY").is_some_and(|v| v == "1") {
         virtual_tried = true;
+        virtual_made_at = virtual_size(&shared);
         virtual_display = switch_to_virtual_display(&shared, s.fps);
     }
     let mut frame_id: u32 = 0;
@@ -542,6 +576,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
         // (Re)create the pipeline. Failures (device lost, driver reset, mode change) restart
         // it instead of ending the session.
         shared.switch.store(false, Ordering::Release);
+        if resize_virtual {
+            // The old pipeline is gone (it captured the old monitor): replace the monitor.
+            resize_virtual = false;
+            drop(virtual_display.take()); // remove the old monitor before adding the new one
+            virtual_made_at = virtual_size(&shared);
+            println!("virtual display: the viewer is now {}x{}; re-creating it at that size", virtual_made_at.0, virtual_made_at.1);
+            virtual_display = switch_to_virtual_display(&shared, s.fps);
+        }
         crate::desktop::follow_input_desktop();
         if let Some(m) = changed_monitor(&shared) {
             shared.input.set_monitor(m.clone());
@@ -592,8 +634,14 @@ fn video_thread(conn: Connection, s: Settings, shared: Arc<Shared>) {
             }
             // Nothing is drawn (no monitor): once per session, try a virtual monitor and share
             // that with the fast capture instead of the slow fallback.
+            // The viewer's picture area changed size: match it (pixels stay 1:1).
+            if virtual_display.is_some() && virtual_size(&shared) != virtual_made_at {
+                resize_virtual = true;
+                continue 'pipeline;
+            }
             if p.fell_back() && virtual_display.is_none() && !virtual_tried {
                 virtual_tried = true;
+                virtual_made_at = virtual_size(&shared);
                 virtual_display = switch_to_virtual_display(&shared, s.fps);
                 if virtual_display.is_some() {
                     continue 'pipeline;

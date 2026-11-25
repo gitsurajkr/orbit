@@ -52,6 +52,10 @@ pub enum Ctrl {
     SelectMonitor { index: u8 },
     /// S→C: the video's size changed (another screen is shown).
     VideoFormat { width: u16, height: u16 },
+    /// C→S: the viewer's picture area in physical pixels (on connect, and after a resize). A
+    /// sharing PC showing ORBIT's virtual display sizes it to match, so each pixel lands on one
+    /// pixel of the viewer's screen: no scaling, sharp text.
+    ViewSize { width: u16, height: u16 },
     /// S→C: an app-defined pointer image, sent once per distinct image before the first
     /// [`Ctrl::Cursor`] that uses it. `key` is a hash of the pixels; `bgra` is top-down,
     /// straight (not premultiplied) alpha, `width * height * 4` bytes.
@@ -131,6 +135,7 @@ mod tag {
     pub const VIDEO_FORMAT: u8 = 18;
     pub const REF_INVALIDATE: u8 = 19;
     pub const SECURE_ATTENTION: u8 = 20;
+    pub const VIEW_SIZE: u8 = 21;
 }
 
 /// Longest name / reason text carried (bytes, cut at a character boundary).
@@ -191,6 +196,11 @@ impl Ctrl {
                 out.extend_from_slice(&width.to_le_bytes());
                 out.extend_from_slice(&height.to_le_bytes());
                 tag::VIDEO_FORMAT
+            }
+            Ctrl::ViewSize { width, height } => {
+                out.extend_from_slice(&width.to_le_bytes());
+                out.extend_from_slice(&height.to_le_bytes());
+                tag::VIEW_SIZE
             }
             Ctrl::PairRequired { code_active } => {
                 out.push(code_active as u8);
@@ -290,6 +300,10 @@ impl Ctrl {
             tag::VIDEO_FORMAT => {
                 need(4)?;
                 Ctrl::VideoFormat { width: u16_at(0), height: u16_at(2) }
+            }
+            tag::VIEW_SIZE => {
+                need(4)?;
+                Ctrl::ViewSize { width: u16_at(0), height: u16_at(2) }
             }
             tag::PAIR_REQUIRED => {
                 need(1)?;
@@ -391,6 +405,7 @@ mod tests {
             Ctrl::RefInvalidate { from: 0xFFFF_FFF0 },
             Ctrl::SecureAttention,
             Ctrl::VideoFormat { width: 1920, height: 1080 },
+            Ctrl::ViewSize { width: 1918, height: 1009 },
             Ctrl::PairStart { msg: vec![1, 2, 3] },
             Ctrl::PairReply { msg: vec![4; 33] },
             Ctrl::PairProof { proof: vec![5; 32] },

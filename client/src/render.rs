@@ -36,8 +36,18 @@ struct Vp {
     proc_: ID3D11VideoProcessor,
 }
 
-/// Largest rectangle with the video's aspect ratio centered in the window.
+/// Up to this many pixels smaller than the window (each way), the video is shown 1:1 with a thin
+/// border instead of stretched: a sharing PC sizing its virtual display to this window rounds the
+/// width down to a multiple of 8, and stretching by those few pixels would blur everything.
+const ONE_TO_ONE_SLACK: u32 = 16;
+
+/// Where the video goes in the window: 1:1 and centered if it's the window's size or a few pixels
+/// smaller, otherwise the largest rectangle with the video's aspect ratio, centered.
 pub fn fit(video_w: u32, video_h: u32, win_w: u32, win_h: u32) -> RECT {
+    if video_w <= win_w && video_h <= win_h && win_w - video_w <= ONE_TO_ONE_SLACK && win_h - video_h <= ONE_TO_ONE_SLACK {
+        let (x, y) = (((win_w - video_w) / 2) as i32, ((win_h - video_h) / 2) as i32);
+        return RECT { left: x, top: y, right: x + video_w as i32, bottom: y + video_h as i32 };
+    }
     let (vw, vh, ww, wh) = (video_w.max(1) as u64, video_h.max(1) as u64, win_w.max(1) as u64, win_h.max(1) as u64);
     let (w, h) = if ww * vh <= wh * vw { (ww, ww * vh / vw) } else { (wh * vw / vh, wh) };
     let (x, y) = ((ww - w) / 2, (wh - h) / 2);
@@ -197,5 +207,28 @@ impl Renderer {
             self.swap.Present(interval, flags).ok().context("Present")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    fn rect(r: windows::Win32::Foundation::RECT) -> (i32, i32, i32, i32) {
+        (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    }
+
+    #[test]
+    fn exact_or_slightly_smaller_video_is_shown_one_to_one() {
+        assert_eq!(rect(fit(1920, 990, 1920, 990)), (0, 0, 1920, 990));
+        // 1606 wide rounded down to 1600 by the sharing PC: 1:1 with a 3 px edge, not stretched.
+        assert_eq!(rect(fit(1600, 978, 1606, 978)), (3, 0, 1600, 978));
+    }
+
+    #[test]
+    fn other_sizes_scale_to_fit() {
+        assert_eq!(rect(fit(1920, 1080, 960, 540)), (0, 0, 960, 540));
+        assert_eq!(rect(fit(1280, 720, 1920, 1200)), (0, 60, 1920, 1080), "much smaller: scaled up");
+        assert_eq!(rect(fit(1920, 1080, 1920, 1200)), (0, 60, 1920, 1080), "letterboxed");
     }
 }
