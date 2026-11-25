@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 /// quinn's datagram queue. Large on purpose so quinn never silently drops from the middle of a
 /// frame; our own backlog check (below) is what keeps latency low.
-pub const DATAGRAM_SEND_BUFFER: usize = 1 << 20;
+pub const DATAGRAM_SEND_BUFFER: usize = 4 << 20;
 
 #[derive(Clone)]
 pub struct Settings {

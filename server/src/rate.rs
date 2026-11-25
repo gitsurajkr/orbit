@@ -40,7 +40,7 @@ const FORGET: u32 = 30;
 /// FEC parity as a percent of data shards: start, floor, ceiling, steps.
 const FEC_START: u32 = 15;
 const FEC_MIN: u32 = 10;
-const FEC_MAX: u32 = 40;
+pub(crate) const FEC_MAX: u32 = 40;
 const FEC_UP: u32 = 5;
 const FEC_DOWN: u32 = 1;
 

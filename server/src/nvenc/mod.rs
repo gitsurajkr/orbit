@@ -9,8 +9,8 @@
 //!   each frame's output depends only on the past.
 //! - **CBR with a one-frame VBV**: every frame is at most about bitrate/fps bits, so no frame
 //!   bursts onto the network and builds a queue. Keyframes (rare: start, screen switch, a loss
-//!   that couldn't be repaired) may use [`KEYFRAME_SCALE`] frames' worth: at 1x a whole screen
-//!   comes out at the worst quality H.264 has and takes 1-2 s to sharpen.
+//!   that couldn't be repaired) may use up to 4 frames' worth at low bitrates, where 1x gives
+//!   a whole screen the worst quality H.264 has (1-2 s to sharpen); see [`keyframe_scale`].
 //! - **Infinite GOP**: keyframes are sent only at start and when the client asks.
 //! - **Reference-frame invalidation**: the encoder keeps several past frames as references, so
 //!   after a loss the lost frames can be invalidated ([`Encoder::invalidate`]) and the next
@@ -50,8 +50,20 @@ const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
 const CODEC_H264: GUID = guid(0x6bc82762, 0x4e63, 0x4ca4, [0xaa, 0x85, 0x1e, 0x50, 0xf3, 0x21, 0xf6, 0xbf]);
 const PRESET_P1: GUID = guid(0xfc0a8d3e, 0x45f8, 0x4cf8, [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf]);
 
-/// A keyframe may use this many frames' worth of bits (ultra-low-latency tuning defaults to 1).
-const KEYFRAME_SCALE: u8 = 4;
+/// Extra room a keyframe may get, in frames' worth of bits (ultra-low-latency tuning defaults
+/// to 1).
+const KEYFRAME_SCALE_MAX: u32 = 4;
+/// ...but only while the keyframe's budget stays below this. NVENC overshoots a keyframe's
+/// budget up to 2x on a busy screen, and the frame must fit the send buffer: at 4x and 50+ Mbit/s
+/// it didn't (1 MB then), so every keyframe was dropped and the viewer stayed black (v0.3.6).
+const KEYFRAME_BUDGET_BYTES: u32 = 500_000;
+
+/// `lowDelayKeyFrameScale` for this bitrate: 4 up to 50 Mbit/s at 60 fps, 2 at 100, 1 at 200, where
+/// a one-frame budget is already enough for a sharp keyframe.
+fn keyframe_scale(bps: u32, fps: u32) -> u8 {
+    let frame_bytes = (bps / 8 / fps.max(1)).max(1);
+    (KEYFRAME_BUDGET_BYTES / frame_bytes).clamp(1, KEYFRAME_SCALE_MAX) as u8
+}
 
 const FMT_ARGB: NV_ENC_BUFFER_FORMAT = _NV_ENC_BUFFER_FORMAT_NV_ENC_BUFFER_FORMAT_ARGB;
 const TUNING_ULL: NV_ENC_TUNING_INFO = NV_ENC_TUNING_INFO_NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
@@ -199,7 +211,7 @@ impl Encoder {
         rc.maxBitRate = cfg.bitrate_bps;
         rc.vbvBufferSize = cfg.bitrate_bps / cfg.fps.max(1); // one frame
         rc.vbvInitialDelay = rc.vbvBufferSize;
-        rc.lowDelayKeyFrameScale = KEYFRAME_SCALE;
+        rc.lowDelayKeyFrameScale = keyframe_scale(cfg.bitrate_bps, cfg.fps);
         rc.set_zeroReorderDelay(1);
         rc.set_enableLookahead(0);
         rc.lookaheadDepth = 0;
@@ -337,6 +349,7 @@ impl Encoder {
             rc.maxBitRate = bps;
             rc.vbvBufferSize = bps / self.cfg.fps.max(1);
             rc.vbvInitialDelay = rc.vbvBufferSize;
+            rc.lowDelayKeyFrameScale = keyframe_scale(bps, self.cfg.fps);
             let mut re: NV_ENC_RECONFIGURE_PARAMS = zeroed();
             re.version = RECONFIGURE_VER;
             re.reInitEncodeParams = *self.init;
@@ -389,45 +402,58 @@ mod tests {
         assert_eq!(super::max_refs(3840, 2160), 5);
     }
 
-    /// Encodes a busy, desktop-like 1080p image as a keyframe, then the same image again, and
-    /// prints the frame sizes against the one-frame budget. Skipped without an NVIDIA GPU.
     #[test]
-    fn keyframe_gets_its_budget() {
+    fn keyframe_scale_shrinks_as_bitrate_grows() {
+        use super::keyframe_scale;
+        assert_eq!(keyframe_scale(20_000_000, 60), 4);
+        assert_eq!(keyframe_scale(50_000_000, 60), 4);
+        assert_eq!(keyframe_scale(100_000_000, 60), 2);
+        assert_eq!(keyframe_scale(200_000_000, 60), 1);
+        assert_eq!(keyframe_scale(10_000_000, 30), 4);
+    }
+
+    /// Busy, desktop-like images (worst case for size) at every bitrate the app allows: the
+    /// keyframe must fit the send buffer with room to spare, even with the most FEC parity, or
+    /// it's dropped and the viewer never gets a picture. At 20 Mbit/s it must also come out
+    /// sharper than the worst quality. Skipped without an NVIDIA GPU.
+    #[test]
+    fn keyframes_fit_the_send_buffer() {
         use crate::capture::{find_adapter, Gpu, NVIDIA_VENDOR};
         let Ok(Some((nv, _))) = find_adapter(NVIDIA_VENDOR) else {
             eprintln!("no NVIDIA GPU: skipped");
             return;
         };
-        let (w, h, fps, bps) = (1920u32, 1080u32, 60u32, 20_000_000u32);
         let gpu = Gpu::on_adapter(nv).unwrap();
-        let tex = gpu.screen_texture(w, h).unwrap();
-        // Text-like detail: small high-contrast glyph blocks on a light background.
-        let mut px = vec![0u8; (w * h * 4) as usize];
-        let mut seed = 0x1234_5678u32;
-        for y in 0..h {
-            for x in 0..w {
-                let cell = (x / 8) * 7919 + (y / 16) * 104_729;
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let ink = (cell % 3 != 0) && (seed >> 28) < 6 && y % 16 < 12;
-                let v = if ink { 30 } else { 240 };
-                let i = ((y * w + x) * 4) as usize;
-                px[i..i + 4].copy_from_slice(&[v, v, (v as u32 * 9 / 10) as u8, 255]);
+        let fps = 60u32;
+        for (w, h) in [(1920u32, 1080u32), (3840, 2160)] {
+            let tex = gpu.screen_texture(w, h).unwrap();
+            // Text-like detail: small high-contrast glyph blocks on a light background.
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            let mut seed = 0x1234_5678u32;
+            for y in 0..h {
+                for x in 0..w {
+                    let cell = (x / 8) * 7919 + (y / 16) * 104_729;
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let ink = (cell % 3 != 0) && (seed >> 28) < 6 && y % 16 < 12;
+                    let v = if ink { 30 } else { 240 };
+                    let i = ((y * w + x) * 4) as usize;
+                    px[i..i + 4].copy_from_slice(&[v, v, (v as u32 * 9 / 10) as u8, 255]);
+                }
+            }
+            unsafe { gpu.ctx.UpdateSubresource(&tex, 0, None, px.as_ptr() as *const _, w * 4, 0) };
+            for mbps in [10u32, 20, 50, 100, 200] {
+                let bps = mbps * 1_000_000;
+                let mut enc = super::Encoder::new(&gpu.device, &tex, super::EncoderConfig { width: w, height: h, fps, bitrate_bps: bps }).unwrap();
+                let mut out = Vec::new();
+                let f = enc.encode(true, 0, &mut out).unwrap();
+                assert!(f.keyframe);
+                let wire = proto::video::datagram_count(out.len(), 1200, crate::rate::FEC_MAX) * 1200;
+                eprintln!("{w}x{h} {mbps:3} Mbit/s | scale {} | keyframe {:4} KB | on the wire {:4} KB | qp {}", super::keyframe_scale(bps, fps), out.len() / 1024, wire / 1024, f.qp);
+                assert!(wire <= crate::session::DATAGRAM_SEND_BUFFER / 2, "{w}x{h} at {mbps} Mbit/s: keyframe of {wire} bytes on the wire");
+                if (w, mbps) == (1920, 20) {
+                    assert!(f.qp < 51, "keyframe at the worst quality again");
+                }
             }
         }
-        unsafe { gpu.ctx.UpdateSubresource(&tex, 0, None, px.as_ptr() as *const _, w * 4, 0) };
-        let mut enc = super::Encoder::new(&gpu.device, &tex, super::EncoderConfig { width: w, height: h, fps, bitrate_bps: bps }).unwrap();
-        let budget = (bps / fps / 8) as usize;
-        let mut out = Vec::new();
-        let mut sizes = Vec::new();
-        let mut qps = Vec::new();
-        for i in 0..8u64 {
-            out.clear();
-            let f = enc.encode(i == 0, i * 16_667, &mut out).unwrap();
-            assert_eq!(f.keyframe, i == 0);
-            sizes.push(out.len());
-            qps.push(f.qp);
-        }
-        eprintln!("scale {} | budget {} KB/frame | keyframe {} KB | next frames {:?} KB | qp {:?}", super::KEYFRAME_SCALE, budget / 1024, sizes[0] / 1024, sizes[1..].iter().map(|s| s / 1024).collect::<Vec<_>>(), qps);
-        assert!(sizes[0] > budget / 2, "keyframe used its budget");
     }
 }
