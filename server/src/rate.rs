@@ -17,11 +17,18 @@
 //! | 15 ms, or net wait > 10 %                              |                         |
 //! | one stray lost packet                                  | hold (burst, not a cap) |
 //! | RTT > 1.5×best + 8 ms                                  | ×0.9                    |
-//! | clean, but less than half the rate was used (idle)     | stay: proves nothing    |
+//! | clean, but less than half the rate was used (idle)     | recover up to "proven"  |
 //! | clean                                                  | climb (see below)       |
 //!
-//! A session starts at [`START_BPS`] (or the configured maximum, if lower) and only climbs on
-//! seconds that actually carried traffic. Idle seconds used to count as clean, so after a still
+//! RTT rules only count in busy seconds (an idle sender can't be the cause of a slower round
+//! trip), and a loss percentage needs [`MIN_PACKETS_FOR_RATIO`] packets.
+//!
+//! "Proven" is the highest rate a busy second carried without trouble (the start rate counts),
+//! lowered by trouble under load. Idle seconds climb back up to it (+10 % a second), so a cut
+//! caused by noise on a calm desktop comes back, but never beyond what the path has carried.
+//!
+//! A session starts at [`START_BPS`] (or the configured maximum, if lower) and only climbs past
+//! the proven rate on seconds that actually carried traffic. Idle seconds used to count as clean, so after a still
 //! screen the rate sat at the maximum without ever having carried it; the next burst of screen
 //! changes then overflowed a slow path (a Tailscale relay: 30-70 % loss, 4 s freezes).
 //!
@@ -47,6 +54,8 @@ const BUSY: f64 = 0.5;
 const HEAVY_LOSS: f64 = 0.10;
 /// Seconds after the last loss during which the path counts as lossy (see `recently_lossy`).
 const LOSSY_FOR: u32 = 10;
+/// Fewer packets than this in a second: no loss percentage (only "lost some, twice in a row").
+const MIN_PACKETS_FOR_RATIO: u64 = 50;
 /// Seconds of RTT history for the "best RTT" baseline.
 const RTT_WINDOW: usize = 10;
 /// Clean seconds to wait after a cut before climbing.
@@ -84,6 +93,9 @@ pub struct RateControl {
     fec: u32,
     /// Seconds since the last second with a lost packet.
     since_loss: u32,
+    /// Highest rate a busy second carried without trouble (the start rate counts), lowered by
+    /// trouble under load. Idle seconds recover up to it, never beyond.
+    proven: u32,
 }
 
 impl RateControl {
@@ -101,6 +113,7 @@ impl RateControl {
             reason: "start",
             fec: FEC_START,
             since_loss: LOSSY_FOR,
+            proven: max.min(START_BPS),
         }
     }
 
@@ -142,25 +155,35 @@ impl RateControl {
         let loss = if r.sent_packets > 0 { r.lost_packets as f64 / r.sent_packets as f64 } else { 0.0 };
         let lossy = r.lost_packets > 0;
 
+        // A loss *percentage* from a handful of packets means little (1 of 8 is "12 %").
+        let loss = if r.sent_packets >= MIN_PACKETS_FOR_RATIO { loss } else { 0.0 };
         let idle = (r.sent_bps as f64) < self.video_bps() as f64 * BUSY;
+        // RTT rules only count in busy seconds: sending little, a slower round trip can't be our
+        // own queue, it's the path's jitter. (Counting it ratcheted the rate down to 1 Mbit/s on
+        // a calm desktop, seen on the workstation: blurry, and idle seconds never climbed back.)
+        let busy_rtt = |limit: Duration| !idle && r.rtt > limit;
 
-        if r.rtt > best * 3 + ms(100) || r.net_wait > 0.5 {
-            self.cut(0.5, if r.net_wait > 0.5 { "net wait" } else { "queue" });
+        if r.net_wait > 0.5 {
+            self.cut(0.5, "net wait", idle);
+        } else if busy_rtt(best * 3 + ms(100)) {
+            self.cut(0.5, "queue", idle);
         } else if loss > HEAVY_LOSS {
-            self.cut(0.5, "heavy loss");
+            self.cut(0.5, "heavy loss", idle);
         } else if loss > 0.05 || (lossy && self.lossy_prev) {
-            self.cut(0.8, "loss");
+            self.cut(0.8, "loss", idle);
         } else if r.net_wait > 0.1 {
-            self.cut(0.8, "net wait");
-        } else if r.rtt > best * 2 + ms(15) {
-            self.cut(0.8, "rtt");
+            self.cut(0.8, "net wait", idle);
+        } else if busy_rtt(best * 2 + ms(15)) {
+            self.cut(0.8, "rtt", idle);
         } else if lossy {
             self.reason = "burst"; // one stray loss: keep the rate, don't count as clean
-        } else if r.rtt.as_secs_f64() > best.as_secs_f64() * 1.5 + 0.008 {
-            self.cut(0.9, "rtt");
+        } else if busy_rtt(Duration::from_secs_f64(best.as_secs_f64() * 1.5 + 0.008)) {
+            self.cut(0.9, "rtt", idle);
         } else if idle {
-            self.reason = "idle"; // nothing to learn: keep the rate, don't count as clean
+            self.recover();
         } else {
+            // A busy second without trouble: this rate is proven to work.
+            self.proven = self.proven.max(self.bps);
             self.climb();
         }
         self.lossy_prev = lossy;
@@ -169,12 +192,31 @@ impl RateControl {
         self.bps
     }
 
-    fn cut(&mut self, factor: f64, reason: &'static str) {
+    /// `idle`: the trouble came in a second that sent little, so it says nothing about what the
+    /// path carries under load: the proven rate stays (idle seconds may recover to it).
+    fn cut(&mut self, factor: f64, reason: &'static str, idle: bool) {
         self.trouble_at = Some(self.bps);
         self.bps = ((self.bps as f64 * factor) as u32).max(MIN_BPS);
+        if !idle {
+            self.proven = self.proven.min(self.bps);
+        }
         self.hold = HOLD;
         self.clean = 0;
         self.reason = reason;
+    }
+
+    /// An idle second: it proves nothing, so never above the proven rate; but up to it (+10 % a
+    /// second), so a rate cut by noise comes back while the desktop is calm.
+    fn recover(&mut self) {
+        if self.hold > 0 {
+            self.hold -= 1;
+            self.reason = "hold";
+        } else if self.bps < self.proven {
+            self.bps = ((self.bps as f64 * 1.1) as u32).min(self.proven);
+            self.reason = "recover";
+        } else {
+            self.reason = "idle";
+        }
     }
 
     fn climb(&mut self) {
@@ -377,5 +419,58 @@ mod tests {
         }
         r.update(&clean(90));
         assert!(!r.recently_lossy());
+    }
+
+    #[test]
+    fn rtt_jitter_on_a_calm_desktop_keeps_the_rate() {
+        // The workstation log: idle desktop, round trip 54 -> 74 -> 137 ms, no loss. It used to
+        // cut 9 -> 3 -> 1 Mbit/s and stay there.
+        let mut r = RateControl::new(20 * M);
+        for rtt in [55, 54, 74, 60, 137, 58, 72, 140, 56] {
+            r.update(&idle(rtt));
+        }
+        assert_eq!(r.bps(), START_BPS);
+        assert_eq!(r.reason(), "idle");
+    }
+
+    #[test]
+    fn a_cut_from_noise_while_idle_recovers_to_the_proven_rate() {
+        let mut r = RateControl::new(20 * M);
+        let lossy_idle = Report { lost_packets: 1, ..idle(60) };
+        r.update(&lossy_idle);
+        r.update(&lossy_idle); // two lossy seconds in a row: cut
+        assert!(r.bps() < START_BPS);
+        for _ in 0..HOLD {
+            r.update(&idle(60));
+            assert_eq!(r.reason(), "hold");
+        }
+        for _ in 0..5 {
+            r.update(&idle(60));
+        }
+        assert_eq!(r.bps(), START_BPS, "back to the proven start rate");
+        for _ in 0..20 {
+            r.update(&idle(60));
+        }
+        assert_eq!(r.bps(), START_BPS, "never beyond it while idle");
+    }
+
+    #[test]
+    fn trouble_under_load_lowers_what_idle_may_recover_to() {
+        // The relay freeze: loss while busy at 10 -> 5 Mbit/s; a still screen must not go back up.
+        let mut r = RateControl::new(20 * M);
+        r.update(&rep(60, 1000, 300, 0.0));
+        let after = r.bps();
+        for _ in 0..30 {
+            r.update(&idle(60));
+        }
+        assert_eq!(r.bps(), after);
+    }
+
+    #[test]
+    fn a_few_packets_make_no_loss_percentage() {
+        let mut r = RateControl::new(20 * M);
+        // 1 of 8 packets lost on an idle second: no "12 % loss" halving.
+        r.update(&Report { sent_packets: 8, lost_packets: 1, ..idle(60) });
+        assert_eq!(r.bps(), START_BPS);
     }
 }
