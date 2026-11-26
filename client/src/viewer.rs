@@ -98,6 +98,15 @@ pub fn run_viewer(server: &str, view_only: bool, opts: &net::ConnectOptions) -> 
             drops: session.sync.as_ref().map(|s| s.drop_files()),
         })
     });
+    // Same size as this screen: start fullscreen, so the picture is pixel for pixel.
+    if matches_this_screen(hwnd, session.width, session.height) {
+        SINK.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut() {
+                toggle_fullscreen(hwnd, s);
+            }
+        });
+        println!("display: fullscreen, pixel for pixel ({}x{} is this screen's size) | Ctrl+Alt+Enter for a window", session.width, session.height);
+    }
     if !view_only {
         ctrl_alt_del_menu(hwnd);
         // Files dragged onto the window go to the sharing PC's Downloads\ORBIT.
@@ -396,6 +405,25 @@ fn toggle_fullscreen(hwnd: HWND, s: &mut InputSink) {
             let _ = SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
         }
     }
+    // SetWindowPos sends WM_SIZE right away, while the caller still holds the sink, so the window
+    // procedure skipped it: record the new size here (mouse mapping, renderer, ViewSize).
+    let (w, h) = client_size(hwnd);
+    s.win_w = w;
+    s.win_h = h;
+    s.resized = Some((w, h));
+}
+
+/// The remote screen is exactly the size of the screen this window is on: fullscreen then shows
+/// it pixel for pixel (a window's title bar and the taskbar would force scaling it down).
+fn matches_this_screen(hwnd: HWND, video_w: u32, video_h: u32) -> bool {
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
+        }
+    }
+    let m = mi.rcMonitor;
+    ((m.right - m.left) as u32, (m.bottom - m.top) as u32) == (video_w, video_h)
 }
 
 fn lparam_xy(l: LPARAM) -> (i32, i32) {
